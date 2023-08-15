@@ -81,9 +81,10 @@ module System.Hworker
   , requeueCron
   , checkCron
     -- * Inspecting Workers
-  , jobs
-  , failed
-  , scheduled
+  , listJobs
+  , listFailed
+  , listScheduled
+  , getCronProcessing
   , broken
   , batchSummary
     -- * Debugging Utilities
@@ -1100,9 +1101,21 @@ broken hw =
       Right xs -> return (map (second parseTime) xs)
 
 
-jobsFromQueue :: Job s t => Hworker s t -> ByteString -> IO [t]
-jobsFromQueue hw q =
-  runRedis (hworkerConnection hw) (R.lrange q 0 (-1)) >>=
+-- | Returns pending jobs.
+
+listJobs :: Job s t => Hworker s t -> Integer -> Integer -> IO [t]
+listJobs hw offset limit =
+  listJobsFromQueue hw (jobQueue hw) offset limit
+
+
+listJobsFromQueue ::
+  Job s t => Hworker s t -> ByteString -> Integer -> Integer -> IO [t]
+listJobsFromQueue hw q offset limit =
+  let
+    a = offset * limit
+    b = (offset + 1) * limit - 1
+  in
+  runRedis (hworkerConnection hw) (R.lrange q a b) >>=
     \case
       Left err ->
         hwlog hw err >> return []
@@ -1112,20 +1125,18 @@ jobsFromQueue hw q =
 
       Right xs ->
         return $ mapMaybe (fmap (\(JobRef _ _ _, x) -> x) . A.decodeStrict) xs
-
-
--- | Returns all pending jobs.
-
-jobs :: Job s t => Hworker s t -> IO [t]
-jobs hw =
-  jobsFromQueue hw (jobQueue hw)
 
 
 -- | Returns all scheduled jobs
 
-scheduled :: Job s t => Hworker s t -> IO [t]
-scheduled hw =
-  runRedis (hworkerConnection hw) (R.zrange (scheduleQueue hw) 0 (-1)) >>=
+listScheduled ::
+  Job s t => Hworker s t -> Integer -> Integer -> IO [(t, UTCTime)]
+listScheduled hw offset limit =
+  let
+    a = offset * limit
+    b = (offset + 1) * limit - 1
+  in
+  runRedis (hworkerConnection hw) (R.zrangeWithscores (scheduleQueue hw) a b) >>=
     \case
       Left err ->
         hwlog hw err >> return []
@@ -1134,17 +1145,35 @@ scheduled hw =
         return []
 
       Right xs ->
-        return $ mapMaybe (fmap (\(JobRef _ _ _, x) -> x) . A.decodeStrict) xs
+        return $
+          mapMaybe
+            ( \(bytes, s) ->
+                case A.decodeStrict bytes of
+                  Just (JobRef _ _ _, j) -> Just (j, doubleToUtc s)
+                  Nothing                -> Nothing
+            )
+            xs
 
 
--- | Returns all failed jobs. This is capped at the most recent
+-- | Returns timestamp of active cron job.
+
+getCronProcessing ::
+  Job s t => Hworker s t -> Text -> IO (Maybe UTCTime)
+getCronProcessing hw cron =
+  runRedis (hworkerConnection hw) (R.hget (cronProcessing hw) (T.encodeUtf8 cron)) >>=
+    \case
+      Right mbytes -> return $ mbytes >>= A.decodeStrict
+      Left _       -> return Nothing
+
+
+-- | Returns failed jobs. This is capped at the most recent
 -- 'hworkerconfigFailedQueueSize' jobs that returned 'Failure' (or
 -- threw an exception when 'hworkerconfigExceptionBehavior' is
 -- 'FailOnException').
 
-failed :: Job s t => Hworker s t -> IO [t]
-failed hw =
-  jobsFromQueue hw (failedQueue hw)
+listFailed :: Job s t => Hworker s t -> Integer -> Integer -> IO [t]
+listFailed hw offset limit =
+  listJobsFromQueue hw (failedQueue hw) offset limit
 
 
 -- | Logs the contents of the jobqueue and the inprogress queue at
@@ -1308,3 +1337,7 @@ failBatchSummary hw batch = do
 
 utcToDouble :: UTCTime -> Double
 utcToDouble = realToFrac . Posix.utcTimeToPOSIXSeconds
+
+
+doubleToUtc :: Double -> UTCTime
+doubleToUtc = Posix.posixSecondsToUTCTime . realToFrac

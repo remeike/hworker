@@ -140,7 +140,7 @@ main = hspec $ do
       queue hworker FailJob
       threadDelay 30000
       killThread wthread
-      failedJobs <- failed hworker
+      failedJobs <- listFailed hworker 0 100
       destroy hworker
       assertEqual "Should have failed job" [FailJob] failedJobs
 
@@ -157,7 +157,7 @@ main = hspec $ do
       queue hworker AlwaysFailJob
       threadDelay 100000
       killThread wthread
-      failedJobs <- failed hworker
+      failedJobs <- listFailed hworker 0 100
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 4, since all jobs were run" 4 v
@@ -309,7 +309,7 @@ main = hspec $ do
         streamBatch hworker batch True $ do
           replicateM_ 50 $ Conduit.yield SimpleJob
           return StreamingOk
-        ls <- jobs hworker
+        ls <- listJobs hworker 0 100
         length ls `shouldBe` 50
         summary <- expectBatchSummary hworker batch
         batchSummaryQueued summary `shouldBe` 50
@@ -323,7 +323,7 @@ main = hspec $ do
         streamBatch hworker batch True $ do
           replicateM_ 20 $ Conduit.yield SimpleJob
           return (StreamingAborted "abort")
-        ls <- jobs hworker
+        ls <- listJobs hworker 0 100
         expectBatchSummary hworker batch
         destroy hworker
         length ls `shouldBe` 0
@@ -337,7 +337,7 @@ main = hspec $ do
           _ <- lift $ Redis.lpush "" []
           replicateM_ 20 $ Conduit.yield SimpleJob
           return StreamingOk
-        ls <- jobs hworker
+        ls <- listJobs hworker 0 100
         destroy hworker
         length ls `shouldBe` 0
 
@@ -349,7 +349,7 @@ main = hspec $ do
         streamBatch hworker batch True $ do
           replicateM_ 20 $ Conduit.yield SimpleJob
           return StreamingOk
-        ls <- jobs hworker
+        ls <- listJobs hworker 0 100
         destroy hworker
         length ls `shouldBe` 0
 
@@ -370,7 +370,7 @@ main = hspec $ do
         threadDelay 190000
         summary1 <- expectBatchSummary hworker batch
         batchSummaryQueued summary1 `shouldBe` 4
-        ls <- jobs hworker
+        ls <- listJobs hworker 0 100
         length ls `shouldBe` 0
         threadDelay 100000
         summary2 <- expectBatchSummary hworker batch
@@ -512,7 +512,7 @@ main = hspec $ do
             { hwconfigCronJobs = [CronJob "cron-test" SimpleJob everyMinute] }
 
       checkCron hworker "cron-test" >>= shouldBe True
-      ls <- scheduled hworker
+      ls <- listScheduled hworker 0 100
       length ls `shouldBe` 1
       destroy hworker
 
@@ -527,7 +527,7 @@ main = hspec $ do
       initCron hworker time [CronJob "cron-test" SimpleJob everyMinute]
       initCron hworker time [CronJob "cron-test" SimpleJob everyMinute]
       initCron hworker time [CronJob "cron-test" SimpleJob everyMinute]
-      ls <- scheduled hworker
+      ls <- listScheduled hworker 0 100
       length ls `shouldBe` 1
       destroy hworker
 
@@ -539,11 +539,12 @@ main = hspec $ do
       time <- getCurrentTime
       initCron hworker (addUTCTime (-60) time) [CronJob "cron-test" SimpleJob everyMinute]
       threadDelay 1000000
-      s <- scheduled hworker
+      s <- listScheduled hworker 0 100
       length s `shouldBe` 0
-      j <- jobs hworker
+      j <- listJobs hworker 0 100
       length j `shouldBe` 1
       checkCron hworker "cron-test" >>= shouldBe True
+      liftIO (getCronProcessing hworker "cron-test") >>= shouldNotBe Nothing
       destroy hworker
       killThread sthread
 
@@ -556,20 +557,38 @@ main = hspec $ do
       wthread <- forkIO (worker hworker)
       sthread <- forkIO (scheduler hworker)
       threadDelay 1000000
-      j <- jobs hworker
+      j <- listJobs hworker 0 100
       length j `shouldBe` 0
-      s <- scheduled hworker
+      s <- listScheduled hworker 0 100
       length s `shouldBe` 1
-      liftIO
-        ( Redis.runRedis (hworkerConnection hworker)
-            $ Redis.hget "hworker-cron-processing-simpleworker-1" "cron-test"
-        ) >>=
-          \case
-            Right result -> result `shouldBe` Nothing
-            Left _       -> fail "cron prossessing not found"
+      liftIO (getCronProcessing hworker "cron-test") >>= shouldBe Nothing
       destroy hworker
       killThread wthread
       killThread sthread
+
+  describe "Listing jobs" $ do
+    it "should list pending jobs" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      replicateM_ 45 (queue hworker SimpleJob)
+      listJobs hworker 0 10 >>= shouldBe 10 . length
+      listJobs hworker 1 10 >>= shouldBe 10 . length
+      listJobs hworker 2 10 >>= shouldBe 10 . length
+      listJobs hworker 3 10 >>= shouldBe 10 . length
+      listJobs hworker 4 10 >>= shouldBe 5 . length
+      destroy hworker
+
+    it "should list scheduled jobs" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      time <- getCurrentTime
+      replicateM_ 45 (queueScheduled hworker SimpleJob (addUTCTime 1 time))
+      listScheduled hworker 0 10 >>= shouldBe 10 . length
+      listScheduled hworker 1 10 >>= shouldBe 10 . length
+      listScheduled hworker 2 10 >>= shouldBe 10 . length
+      listScheduled hworker 3 10 >>= shouldBe 10 . length
+      listScheduled hworker 4 10 >>= shouldBe 5 . length
+      destroy hworker
 
   describe "Broken jobs" $
     it "should store broken jobs" $ do
@@ -596,7 +615,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "dump-1" (SimpleState mvar)) { hwconfigTimeout = 5 }
       queue hworker SimpleJob
-      res <- jobs hworker
+      res <- listJobs hworker 0 100
       destroy hworker
       assertEqual "Should be [SimpleJob]" [SimpleJob] res
 
@@ -605,7 +624,7 @@ main = hspec $ do
       hworker <- createWith (conf "dump-2" (TimedState mvar)) { hwconfigTimeout = 5 }
       queue hworker (TimedJob 1)
       queue hworker (TimedJob 2)
-      res <- jobs hworker
+      res <- listJobs hworker 0 100
       destroy hworker
       assertEqual "Should by [TimedJob 2, TimedJob 1]" [TimedJob 2, TimedJob 1] res
 
