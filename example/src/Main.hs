@@ -70,7 +70,7 @@ runCron = do
   hworker <-
     createWith
       (defaultHworkerConfig "printer" (State mvar))
-        { hwconfigCronJobs = [CronJob "per-minute" PrintB Schedule.everyMinute] }
+        { hwconfigCronJobs = [CronJob "per-minute" PrintC Schedule.everyMinute] }
   _ <- forkIO (worker hworker)
   _ <- forkIO (monitor hworker)
   _ <- forkIO (scheduler hworker)
