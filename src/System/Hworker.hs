@@ -57,6 +57,7 @@ module System.Hworker
   , BatchId(..)
   , BatchStatus(..)
   , BatchSummary(..)
+  , CronJob(..)
   , QueueingResult(..)
   , StreamingResult(..)
     -- * Managing Workers
@@ -74,9 +75,15 @@ module System.Hworker
   , streamBatchTx
   , initBatch
   , stopBatchQueueing
+    -- * Cron Jobs
+  , initCron
+  , queueCron
+  , requeueCron
+  , checkCron
     -- * Inspecting Workers
   , jobs
   , failed
+  , scheduled
   , broken
   , batchSummary
     -- * Debugging Utilities
@@ -97,7 +104,7 @@ import           Control.Exception       ( SomeException
                                          )
 import           Control.Monad           ( forM_, forever, void, when )
 import           Control.Monad.Trans     ( liftIO, lift )
-import           Data.Aeson              ( FromJSON, ToJSON, (.=), (.:) )
+import           Data.Aeson              ( FromJSON, ToJSON, (.=), (.:), (.:?) )
 import qualified Data.Aeson             as A
 import           Data.ByteString         ( ByteString )
 import qualified Data.ByteString.Char8  as B8
@@ -127,6 +134,8 @@ import           Database.Redis          ( Redis
                                          )
 import qualified Database.Redis         as R
 import           GHC.Generics            ( Generic )
+import           Saturn                  ( Schedule )
+import qualified Saturn                 as Schedule
 --------------------------------------------------------------------------------
 
 
@@ -211,6 +220,10 @@ data StreamingResult
   | StreamingAborted Text  -- Close the stream with the given error message,
                            -- reverting all previously added jobs
 
+-- | Represents a recurring job that executes on a particular schedule.
+
+data CronJob t =
+  CronJob Text t Schedule
 
 
 -- | Represents the current status of a batch. A batch is considered to be
@@ -247,12 +260,13 @@ data BatchSummary =
 
 
 data JobRef =
-  JobRef JobId (Maybe BatchId)
+  JobRef JobId (Maybe BatchId) (Maybe Text)
   deriving (Eq, Show)
 
 
 instance ToJSON JobRef where
-  toJSON (JobRef j b) = A.object ["j" .= j, "b" .= b]
+  toJSON (JobRef j b s) =
+    A.object ["j" .= j, "b" .= b, "s" .= s]
 
 
 instance FromJSON JobRef where
@@ -260,8 +274,8 @@ instance FromJSON JobRef where
   -- can be removed eventually. Before `JobRef`, which is encoded as
   -- a JSON object, there was a just a `String` representing the job ID.
 
-  parseJSON (A.String j) = pure (JobRef j Nothing)
-  parseJSON val = A.withObject "JobRef" (\o -> JobRef <$> o .: "j" <*> o .: "b") val
+  parseJSON (A.String j) = pure (JobRef j Nothing Nothing)
+  parseJSON val = A.withObject "JobRef" (\o -> JobRef <$> o .: "j" <*> o .: "b" <*> o .:? "s") val
 
 
 hwlog :: Show a => Hworker s t -> a -> IO ()
@@ -322,7 +336,7 @@ data RedisConnection
 -- 'hwconfigFailedQueueSize' controls how many 'failed' jobs will be
 -- kept. It defaults to 1000.
 
-data HworkerConfig s =
+data HworkerConfig s t =
   HworkerConfig
     { hwconfigName              :: Text
     , hwconfigState             :: s
@@ -333,13 +347,14 @@ data HworkerConfig s =
     , hwconfigFailedQueueSize   :: Int
     , hwconfigDebug             :: Bool
     , hwconfigBatchCompleted    :: BatchSummary -> IO ()
+    , hwconfigCronJobs          :: [CronJob t]
     }
 
 
 -- | The default worker config - it needs a name and a state (as those
 -- will always be unique).
 
-defaultHworkerConfig :: Text -> s -> HworkerConfig s
+defaultHworkerConfig :: Text -> s -> HworkerConfig s t
 defaultHworkerConfig name state =
   HworkerConfig
     { hwconfigName              = name
@@ -351,6 +366,7 @@ defaultHworkerConfig name state =
     , hwconfigFailedQueueSize   = 1000
     , hwconfigDebug             = False
     , hwconfigBatchCompleted    = const (return ())
+    , hwconfigCronJobs          = []
     }
 
 
@@ -371,25 +387,30 @@ create name state =
 -- the queue to actually process jobs (and for it to retry ones that
 -- time-out).
 
-createWith :: Job s t => HworkerConfig s -> IO (Hworker s t)
+createWith :: Job s t => HworkerConfig s t -> IO (Hworker s t)
 createWith HworkerConfig{..} = do
   conn <-
     case hwconfigRedisConnectInfo of
       RedisConnectInfo c -> R.connect c
       RedisConnection  c -> return c
 
-  return $
-    Hworker
-      { hworkerName              = T.encodeUtf8 hwconfigName
-      , hworkerState             = hwconfigState
-      , hworkerConnection        = conn
-      , hworkerExceptionBehavior = hwconfigExceptionBehavior
-      , hworkerLogger            = hwconfigLogger
-      , hworkerJobTimeout        = hwconfigTimeout
-      , hworkerFailedQueueSize   = hwconfigFailedQueueSize
-      , hworkerDebug             = hwconfigDebug
-      , hworkerBatchCompleted    = hwconfigBatchCompleted
-      }
+  let
+    hworker =
+      Hworker
+        { hworkerName              = T.encodeUtf8 hwconfigName
+        , hworkerState             = hwconfigState
+        , hworkerConnection        = conn
+        , hworkerExceptionBehavior = hwconfigExceptionBehavior
+        , hworkerLogger            = hwconfigLogger
+        , hworkerJobTimeout        = hwconfigTimeout
+        , hworkerFailedQueueSize   = hwconfigFailedQueueSize
+        , hworkerDebug             = hwconfigDebug
+        , hworkerBatchCompleted    = hwconfigBatchCompleted
+        }
+
+  time <- getCurrentTime
+  initCron hworker time hwconfigCronJobs
+  return hworker
 
 
 -- | Destroy a worker. This will delete all the queues, clearing out
@@ -415,6 +436,8 @@ destroy hw =
       , brokenQueue hw
       , failedQueue hw
       , scheduleQueue hw
+      , cronSchedule hw
+      , cronProcessing hw
       ]
 
 
@@ -448,6 +471,16 @@ batchCounter hw (BatchId batch) =
   "hworker-batch-" <> hworkerName hw <> ":" <> UUID.toASCIIBytes batch
 
 
+cronSchedule :: Hworker s t -> ByteString
+cronSchedule hw  =
+  "hworker-cron-schedule-" <> hworkerName hw
+
+
+cronProcessing :: Hworker s t -> ByteString
+cronProcessing hw  =
+  "hworker-cron-processing-" <> hworkerName hw
+
+
 -- | Adds a job to the queue. Returns whether the operation succeeded.
 
 queue :: Job s t => Hworker s t -> t -> IO Bool
@@ -456,8 +489,117 @@ queue hw j = do
   result <-
     runRedis (hworkerConnection hw)
       $ R.lpush (jobQueue hw)
-      $ [LB.toStrict $ A.encode (JobRef jobId Nothing, j)]
+      $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
   return $ isRight result
+
+
+-- | Initializes all cron jobs. This is will add all of the cron schedules
+-- if not already present or update the schedules if they are.
+
+initCron :: Job s t => Hworker s t -> UTCTime -> [CronJob t] -> IO ()
+initCron hw time cronJobs = do
+  void
+    $ runRedis (hworkerConnection hw)
+    $ R.hmset (cronSchedule hw)
+    $ fmap
+        ( \(CronJob cron _ schedule) ->
+            (T.encodeUtf8 cron, T.encodeUtf8 $ Schedule.toText schedule)
+        )
+        cronJobs
+
+  mapM_
+    ( \cron@(CronJob name _ _) -> do
+        exists <- checkCron hw name
+        when (not exists) $ void $ queueCron hw time cron
+    )
+    cronJobs
+
+
+-- | Queues a cron job for the first time, adding it to the schedule queue
+-- at its next scheduled time.
+
+queueCron :: Job s t => Hworker s t -> UTCTime -> CronJob t -> IO Bool
+queueCron hw time (CronJob cron j schedule) = do
+  jobId <- UUID.toText <$> UUID.nextRandom
+  case Schedule.nextMatch time schedule of
+    Nothing ->
+      return False
+
+    Just utc -> do
+      result <-
+        runRedis (hworkerConnection hw) $ R.zadd (scheduleQueue hw) $
+          [ ( utcToDouble utc
+            , LB.toStrict $ A.encode (JobRef jobId Nothing (Just cron), j)
+            )
+          ]
+      return $ isRight result
+
+
+-- | Re-enqueues cron job, removing the record from the cron processing hash
+-- and adding it back to the schedule queue at its next scheduled time.
+
+requeueCron :: Job s t => Hworker s t -> Text -> t -> IO ()
+requeueCron hw cron j = do
+  jobId <- UUID.toText <$> UUID.nextRandom
+  runRedis (hworkerConnection hw) $ do
+    void $ withInt hw $ R.hdel (cronProcessing hw) [T.encodeUtf8 cron]
+    R.hget (cronSchedule hw) (T.encodeUtf8 cron) >>=
+      \case
+        Left err ->
+          liftIO $ hwlog hw err
+
+        Right Nothing ->
+          -- This can happen if the scheduled changed between the job
+          -- being queued for execution and then being requeued
+          liftIO $ hwlog hw $ "CRON NOT FOUND: " <> cron
+
+        Right (Just field) ->
+          case Schedule.fromText (T.decodeUtf8 field) of
+            Left err ->
+              liftIO $ hwlog hw err
+
+            Right schedule -> do
+              time <- liftIO getCurrentTime
+
+              case Schedule.nextMatch time schedule of
+                Nothing ->
+                  liftIO $ hwlog hw $ "CRON SCHEDULE NOT FOUND: " <> field
+
+                Just utc ->
+                  void $ withInt hw $ R.zadd (scheduleQueue hw) $
+                    [ ( utcToDouble utc
+                      , LB.toStrict $ A.encode (JobRef jobId Nothing (Just cron), j)
+                      )
+                    ]
+
+
+-- | Checks if the there is a already a job for a particular cron process
+-- which is either scheduled or currently being processed.
+
+checkCron :: forall s t. Job s t => Hworker s t -> Text -> IO Bool
+checkCron hw cron =
+  runRedis (hworkerConnection hw) $ do
+    R.hget (cronProcessing hw) (T.encodeUtf8 cron) >>=
+      \case
+        Right (Just _) ->
+          return True
+
+        _ ->
+          R.zrange (scheduleQueue hw) 0 (-1) >>=
+            \case
+              Left err -> do
+                liftIO $ hwlog hw err
+                return False
+
+              Right ls ->
+                case traverse A.decodeStrict ls :: Maybe [(JobRef, t)] of
+                  Just scheduledJobs ->
+                    return
+                      $ any (\(JobRef _ _ c, _) -> c == Just cron)
+                      $ scheduledJobs
+
+                  Nothing ->
+                    return False
 
 
 -- | Adds a job to be added to the queue at the specified time.
@@ -469,7 +611,7 @@ queueScheduled hw j utc = do
   result <-
     runRedis (hworkerConnection hw)
       $ R.zadd (scheduleQueue hw)
-      $ [(utcToDouble utc, LB.toStrict $ A.encode (JobRef jobId Nothing, j))]
+      $ [(utcToDouble utc, LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j))]
   return $ isRight result
 
 
@@ -487,7 +629,7 @@ queueBatch hw batch close js =
       mapM_
         ( \j -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
-            let ref = JobRef jobId (Just batch)
+            let ref = JobRef jobId (Just batch) Nothing
             _ <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
 
             -- Do the counting outside of the transaction, hence runRedis here.
@@ -548,7 +690,7 @@ streamBatchTx hw batch close producer =
 
           Just j -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
-            let ref = JobRef jobId (Just batch)
+            let ref = JobRef jobId (Just batch) Nothing
             _ <- lift $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
 
             -- Do the counting outside of the transaction, hence runRedis here.
@@ -568,7 +710,6 @@ streamBatchTx hw batch close producer =
   withBatchQueue hw batch
     $ runRedis (hworkerConnection hw)
     $ R.multiExec run
-
 
 
 withBatchQueue ::
@@ -714,18 +855,23 @@ worker hw =
 
           delayAndRun
 
-        Just (JobRef _ maybeBatch, j) -> do
+        Just (JobRef _ maybeBatch maybeCron, j) ->
+          let
+            nextCron =
+              case maybeCron of
+                Just cron -> requeueCron hw cron j
+                Nothing   -> return ()
+          in do
           runJob (job hw j) >>=
             \case
               Success -> do
                 when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE" :: Text, t)
-
                 case maybeBatch of
                   Nothing -> do
                     deletionResult <-
                       runRedis (hworkerConnection hw)
                         $ R.hdel (progressQueue hw) [t]
-
+                    nextCron
                     case deletionResult of
                       Left err -> hwlog hw err >> delayAndRun
                       Right 1  -> justRun
@@ -752,7 +898,8 @@ worker hw =
                           [progressQueue hw, batchCounter hw batch]
                           [t]
                       )
-                      ( \hm ->
+                      ( \hm -> do
+                          nextCron
                           case decodeBatchSummary batch hm of
                             Nothing -> do
                               hwlog hw ("Job done: did not delete 1" :: Text)
@@ -835,6 +982,7 @@ worker hw =
                             $ hworkerBatchCompleted hw
                       )
 
+                nextCron
                 delayAndRun
 
 
@@ -842,23 +990,49 @@ worker hw =
 -- started in a thread. This is responsible for pushing scheduled jobs
 -- to the queue at the expected time.
 
-scheduler :: Job s t => Hworker s t -> IO ()
-scheduler hw  =
+scheduler :: forall s t . Job s t => Hworker s t -> IO ()
+scheduler hw =
   forever $ do
     now <- getCurrentTime
 
     runRedis (hworkerConnection hw) $ do
-      R.zcount (scheduleQueue hw) 0 (utcToDouble now) >>=
+      R.zrangebyscoreLimit (scheduleQueue hw) 0 (utcToDouble now) 0 5 >>=
         \case
-          Right n | n > 0 ->
-            withNil hw $
-              R.eval
-                "local jobs = redis.call('zrangebyscore', KEYS[1], '0', ARGV[1])\n\
-                \redis.call('lpush', KEYS[2], unpack(jobs))\n\
-                \redis.call('zremrangebyscore', KEYS[1], '0', ARGV[1])\n\
-                \return nil"
-                [scheduleQueue hw, jobQueue hw]
-                [B8.pack (show (utcToDouble now))]
+          Right ls | length ls > 0 ->
+            mapM_
+              ( \l -> do
+                  case A.decodeStrict l :: Maybe (JobRef, t) of
+                    Nothing ->
+                      liftIO
+                        $ hwlog hw
+                        $ "FAILED TO PARSE SCHEDULED JOB" <> show l
+
+                    Just j@(JobRef _ _ (Just cron), _) ->
+                      withNil hw $
+                        R.eval
+                          "redis.call('hset', KEYS[3], ARGV[2], ARGV[3])\n\
+                          \redis.call('lpush', KEYS[2], ARGV[1])\n\
+                          \redis.call('zrem', KEYS[1], ARGV[1])\n\
+                          \return nil"
+                          [ scheduleQueue hw
+                          , jobQueue hw
+                          , cronProcessing hw
+                          ]
+                          [ LB.toStrict $ A.encode j
+                          , T.encodeUtf8 cron
+                          , LB.toStrict $ A.encode now
+                          ]
+
+                    Just j ->
+                      withNil hw $
+                        R.eval
+                          "redis.call('lpush', KEYS[2], ARGV[1])\n\
+                          \redis.call('zrem', KEYS[1], ARGV[1])\n\
+                          \return nil"
+                          [ scheduleQueue hw, jobQueue hw ]
+                          [ LB.toStrict $ A.encode j ]
+              )
+              ls
 
           Right _ ->
             return ()
@@ -937,7 +1111,7 @@ jobsFromQueue hw q =
         return []
 
       Right xs ->
-        return $ mapMaybe (fmap (\(JobRef _ _, x) -> x) . A.decodeStrict) xs
+        return $ mapMaybe (fmap (\(JobRef _ _ _, x) -> x) . A.decodeStrict) xs
 
 
 -- | Returns all pending jobs.
@@ -945,6 +1119,22 @@ jobsFromQueue hw q =
 jobs :: Job s t => Hworker s t -> IO [t]
 jobs hw =
   jobsFromQueue hw (jobQueue hw)
+
+
+-- | Returns all scheduled jobs
+
+scheduled :: Job s t => Hworker s t -> IO [t]
+scheduled hw =
+  runRedis (hworkerConnection hw) (R.zrange (scheduleQueue hw) 0 (-1)) >>=
+    \case
+      Left err ->
+        hwlog hw err >> return []
+
+      Right [] ->
+        return []
+
+      Right xs ->
+        return $ mapMaybe (fmap (\(JobRef _ _ _, x) -> x) . A.decodeStrict) xs
 
 
 -- | Returns all failed jobs. This is capped at the most recent
@@ -1047,15 +1237,20 @@ withNil ::
 withNil hw a =
   a >>=
     \case
-      Left err -> liftIO $ hwlog hw err
+      Left err -> liftIO (hwlog hw err)
       Right _  -> return ()
 
 
 runWithInt :: Hworker s t -> Redis (Either R.Reply Integer) -> IO Integer
 runWithInt hw a =
-  runRedis (hworkerConnection hw) a >>=
+  runRedis (hworkerConnection hw) $ withInt hw a
+
+
+withInt :: Hworker s t -> Redis (Either R.Reply Integer) -> Redis Integer
+withInt hw a =
+  a >>=
     \case
-      Left err -> hwlog hw err >> return (-1)
+      Left err -> liftIO (hwlog hw err) >> return (-1)
       Right n  -> return n
 
 

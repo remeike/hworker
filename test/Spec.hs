@@ -18,6 +18,7 @@ import qualified Data.Text               as T
 import           Data.Time
 import qualified Database.Redis          as Redis
 import           GHC.Generics             ( Generic)
+import           Saturn                   ( everyMinute )
 import           Test.Hspec
 import           Test.HUnit               ( assertEqual )
 --------------------------------------------------------------------------------
@@ -503,6 +504,73 @@ main = hspec $ do
       killThread wthread
       killThread sthread
 
+    it "should queue cron on start up" $ do
+      mvar <- newMVar 0
+      hworker <-
+        createWith
+          (conf "simpleworker-1" (SimpleState mvar))
+            { hwconfigCronJobs = [CronJob "cron-test" SimpleJob everyMinute] }
+
+      checkCron hworker "cron-test" >>= shouldBe True
+      ls <- scheduled hworker
+      length ls `shouldBe` 1
+      destroy hworker
+
+    it "should not enqueue the same job multiple times" $ do
+      mvar <- newMVar 0
+      hworker <-
+        createWith
+          (conf "simpleworker-1" (SimpleState mvar))
+            { hwconfigCronJobs = [CronJob "cron-test" SimpleJob everyMinute] }
+
+      time <- getCurrentTime
+      initCron hworker time [CronJob "cron-test" SimpleJob everyMinute]
+      initCron hworker time [CronJob "cron-test" SimpleJob everyMinute]
+      initCron hworker time [CronJob "cron-test" SimpleJob everyMinute]
+      ls <- scheduled hworker
+      length ls `shouldBe` 1
+      destroy hworker
+
+    it "should add to processing hash once a cron job is pushed to the jobs queue" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      destroy hworker
+      sthread <- forkIO (scheduler hworker)
+      time <- getCurrentTime
+      initCron hworker (addUTCTime (-60) time) [CronJob "cron-test" SimpleJob everyMinute]
+      threadDelay 1000000
+      s <- scheduled hworker
+      length s `shouldBe` 0
+      j <- jobs hworker
+      length j `shouldBe` 1
+      checkCron hworker "cron-test" >>= shouldBe True
+      destroy hworker
+      killThread sthread
+
+    it "should remove from processing hash and re-enqueue once a cron job is executed" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      destroy hworker
+      time <- getCurrentTime
+      initCron hworker (addUTCTime (-60) time) [CronJob "cron-test" SimpleJob everyMinute]
+      wthread <- forkIO (worker hworker)
+      sthread <- forkIO (scheduler hworker)
+      threadDelay 1000000
+      j <- jobs hworker
+      length j `shouldBe` 0
+      s <- scheduled hworker
+      length s `shouldBe` 1
+      liftIO
+        ( Redis.runRedis (hworkerConnection hworker)
+            $ Redis.hget "hworker-cron-processing-simpleworker-1" "cron-test"
+        ) >>=
+          \case
+            Right result -> result `shouldBe` Nothing
+            Left _       -> fail "cron prossessing not found"
+      destroy hworker
+      killThread wthread
+      killThread sthread
+
   describe "Broken jobs" $
     it "should store broken jobs" $ do
       -- NOTE(dbp 2015-08-09): The more common way this could
@@ -691,7 +759,7 @@ instance Job RecurringState RecurringJob where
     return Success
 
 
-conf :: Text -> s -> HworkerConfig s
+conf :: Text -> s -> HworkerConfig s t
 conf n s =
   (defaultHworkerConfig n s)
     { hwconfigLogger = const (return ())

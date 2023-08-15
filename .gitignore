@@ -3,3 +3,5 @@
 cabal.sandbox.config
 dist-stack
 stack.yaml.lock
+dist-newstyle
+cabal.project.local
