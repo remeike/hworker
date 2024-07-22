@@ -482,6 +482,11 @@ cronProcessing hw  =
   "hworker-cron-processing-" <> hworkerName hw
 
 
+cronId :: Text -> Text
+cronId cron =
+  "cron:" <> cron
+
+
 -- | Adds a job to the queue. Returns whether the operation succeeded.
 
 queue :: Job s t => Hworker s t -> t -> IO Bool
@@ -508,20 +513,14 @@ initCron hw time cronJobs = do
         )
         cronJobs
 
-  mapM_
-    ( \cron@(CronJob name _ _) -> do
-        exists <- checkCron hw name
-        when (not exists) $ void $ queueCron hw time cron
-    )
-    cronJobs
+  mapM_ (queueCron hw time) cronJobs
 
 
 -- | Queues a cron job for the first time, adding it to the schedule queue
 -- at its next scheduled time.
 
 queueCron :: Job s t => Hworker s t -> UTCTime -> CronJob t -> IO Bool
-queueCron hw time (CronJob cron j schedule) = do
-  jobId <- UUID.toText <$> UUID.nextRandom
+queueCron hw time (CronJob cron j schedule) =
   case Schedule.nextMatch time schedule of
     Nothing ->
       return False
@@ -530,7 +529,7 @@ queueCron hw time (CronJob cron j schedule) = do
       result <-
         runRedis (hworkerConnection hw) $ R.zadd (scheduleQueue hw) $
           [ ( utcToDouble utc
-            , LB.toStrict $ A.encode (JobRef jobId Nothing (Just cron), j)
+            , LB.toStrict $ A.encode (JobRef (cronId cron) Nothing (Just cron), j)
             )
           ]
       return $ isRight result
@@ -540,8 +539,7 @@ queueCron hw time (CronJob cron j schedule) = do
 -- and adding it back to the schedule queue at its next scheduled time.
 
 requeueCron :: Job s t => Hworker s t -> Text -> t -> IO ()
-requeueCron hw cron j = do
-  jobId <- UUID.toText <$> UUID.nextRandom
+requeueCron hw cron j =
   runRedis (hworkerConnection hw) $ do
     void $ withInt hw $ R.hdel (cronProcessing hw) [T.encodeUtf8 cron]
     R.hget (cronSchedule hw) (T.encodeUtf8 cron) >>=
@@ -569,7 +567,7 @@ requeueCron hw cron j = do
                 Just utc ->
                   void $ withInt hw $ R.zadd (scheduleQueue hw) $
                     [ ( utcToDouble utc
-                      , LB.toStrict $ A.encode (JobRef jobId Nothing (Just cron), j)
+                      , LB.toStrict $ A.encode (JobRef (cronId cron) Nothing (Just cron), j)
                       )
                     ]
 
@@ -1008,21 +1006,25 @@ scheduler hw =
                         $ hwlog hw
                         $ "FAILED TO PARSE SCHEDULED JOB" <> show l
 
-                    Just j@(JobRef _ _ (Just cron), _) ->
-                      withNil hw $
-                        R.eval
-                          "redis.call('hset', KEYS[3], ARGV[2], ARGV[3])\n\
-                          \redis.call('lpush', KEYS[2], ARGV[1])\n\
-                          \redis.call('zrem', KEYS[1], ARGV[1])\n\
-                          \return nil"
-                          [ scheduleQueue hw
-                          , jobQueue hw
-                          , cronProcessing hw
-                          ]
-                          [ LB.toStrict $ A.encode j
-                          , T.encodeUtf8 cron
-                          , LB.toStrict $ A.encode now
-                          ]
+                    Just j@(JobRef ref _ (Just cron), _) ->
+                      -- TODO: deprecate this eventually
+                      if ref == cronId cron then
+                        withNil hw $
+                          R.eval
+                            "redis.call('hset', KEYS[3], ARGV[2], ARGV[3])\n\
+                            \redis.call('lpush', KEYS[2], ARGV[1])\n\
+                            \redis.call('zrem', KEYS[1], ARGV[1])\n\
+                            \return nil"
+                            [ scheduleQueue hw
+                            , jobQueue hw
+                            , cronProcessing hw
+                            ]
+                            [ LB.toStrict $ A.encode j
+                            , T.encodeUtf8 cron
+                            , LB.toStrict $ A.encode now
+                            ]
+                      else
+                        return ()
 
                     Just j ->
                       withNil hw $
