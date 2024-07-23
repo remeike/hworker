@@ -994,54 +994,25 @@ scheduler hw =
   forever $ do
     now <- getCurrentTime
 
-    runRedis (hworkerConnection hw) $ do
-      R.zrangebyscoreLimit (scheduleQueue hw) 0 (utcToDouble now) 0 5 >>=
-        \case
-          Right ls | length ls > 0 ->
-            mapM_
-              ( \l -> do
-                  case A.decodeStrict l :: Maybe (JobRef, t) of
-                    Nothing ->
-                      liftIO
-                        $ hwlog hw
-                        $ "FAILED TO PARSE SCHEDULED JOB" <> show l
-
-                    Just j@(JobRef ref _ (Just cron), _) ->
-                      -- TODO: deprecate this eventually
-                      if ref == cronId cron then
-                        withNil hw $
-                          R.eval
-                            "redis.call('hset', KEYS[3], ARGV[2], ARGV[3])\n\
-                            \redis.call('lpush', KEYS[2], ARGV[1])\n\
-                            \redis.call('zrem', KEYS[1], ARGV[1])\n\
-                            \return nil"
-                            [ scheduleQueue hw
-                            , jobQueue hw
-                            , cronProcessing hw
-                            ]
-                            [ LB.toStrict $ A.encode j
-                            , T.encodeUtf8 cron
-                            , LB.toStrict $ A.encode now
-                            ]
-                      else
-                        return ()
-
-                    Just j ->
-                      withNil hw $
-                        R.eval
-                          "redis.call('lpush', KEYS[2], ARGV[1])\n\
-                          \redis.call('zrem', KEYS[1], ARGV[1])\n\
-                          \return nil"
-                          [ scheduleQueue hw, jobQueue hw ]
-                          [ LB.toStrict $ A.encode j ]
-              )
-              ls
-
-          Right _ ->
-            return ()
-
-          Left err ->
-            liftIO $ hwlog hw err
+    runRedis (hworkerConnection hw) $
+      withNil hw $
+        R.eval
+          "local job = redis.call('zrangebyscore', KEYS[1], 0, ARGV[1], 'limit', 0, 1)[1]\n\
+          \if job ~= nil then\n\
+          \  redis.call('lpush', KEYS[2], tostring(job))\n\
+          \  redis.call('zrem', KEYS[1], tostring(job))\n\
+          \  local cron = cjson.decode(job)[1]['s']\n\
+          \  if cron ~= cjson.null then\n\
+          \    redis.call('hset', KEYS[3], tostring(cron), ARGV[1])\n\
+          \    return tostring(cron) \n\
+          \  end\n\
+          \end\n\
+          \return nil"
+          [ scheduleQueue hw
+          , jobQueue hw
+          , cronProcessing hw
+          ]
+          [ B8.pack $ show (utcToDouble now) ]
 
     threadDelay 500000 >> scheduler hw
 
@@ -1159,8 +1130,7 @@ listScheduled hw offset limit =
 
 -- | Returns timestamp of active cron job.
 
-getCronProcessing ::
-  Job s t => Hworker s t -> Text -> IO (Maybe UTCTime)
+getCronProcessing :: Job s t => Hworker s t -> Text -> IO (Maybe Double)
 getCronProcessing hw cron =
   runRedis (hworkerConnection hw) (R.hget (cronProcessing hw) (T.encodeUtf8 cron)) >>=
     \case
