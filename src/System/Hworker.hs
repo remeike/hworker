@@ -1024,7 +1024,7 @@ scheduler hw =
                             , LB.toStrict $ A.encode now
                             ]
                       else
-                        return ()
+                        void $ R.zrem (scheduleQueue hw) [LB.toStrict $ A.encode j]
 
                     Just j ->
                       withNil hw $
