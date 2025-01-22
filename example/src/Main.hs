@@ -58,8 +58,8 @@ main = do
   hworker <- create "printer" (State mvar)
   _ <- forkIO (worker hworker)
   _ <- forkIO (monitor hworker)
-  _ <- forkIO (forever $ queue hworker PrintA >> threadDelay 1000000)
-  _ <- forkIO (forever $ queue hworker PrintB >> threadDelay 500000)
+  _ <- forkIO (forever $ queue False hworker PrintA >> threadDelay 1000000)
+  _ <- forkIO (forever $ queue False hworker PrintB >> threadDelay 500000)
   forever (threadDelay 1000000)
 
 

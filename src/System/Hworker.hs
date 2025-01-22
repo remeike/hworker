@@ -433,6 +433,7 @@ destroy hw =
 
     R.del
       [ jobQueue hw
+      , priorityQueue hw
       , progressQueue hw
       , brokenQueue hw
       , failedQueue hw
@@ -445,6 +446,11 @@ destroy hw =
 jobQueue :: Hworker s t -> ByteString
 jobQueue hw =
   "hworker-jobs-" <> hworkerName hw
+
+
+priorityQueue :: Hworker s t -> ByteString
+priorityQueue hw =
+  "hworker-priority-jobs-" <> hworkerName hw
 
 
 progressQueue :: Hworker s t -> ByteString
@@ -489,12 +495,12 @@ cronId cron =
 
 -- | Adds a job to the queue. Returns whether the operation succeeded.
 
-queue :: Job s t => Hworker s t -> t -> IO Bool
-queue hw j = do
+queue :: Job s t => Hworker s t -> Bool -> t -> IO Bool
+queue hw priority j = do
   jobId <- UUID.toText <$> UUID.nextRandom
   result <-
     runRedis (hworkerConnection hw)
-      $ R.lpush (jobQueue hw)
+      $ R.lpush (if priority then priorityQueue hw else jobQueue hw)
       $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
   return $ isRight result
 
@@ -780,9 +786,6 @@ stopBatchQueueing hw batch =
 worker :: Job s t => Hworker s t -> IO ()
 worker hw =
   let
-    delayAndRun =
-      threadDelay 10000 >> worker hw
-
     justRun =
       worker hw
 
@@ -812,30 +815,46 @@ worker hw =
         Right result ->
           return result
   in do
-  now <- getCurrentTime
-
-  eitherReply <-
+  result <-
     runRedis (hworkerConnection hw) $
-      R.eval
-        "local job = redis.call('rpop',KEYS[1])\n\
-        \if job ~= nil then\n\
-        \  redis.call('hset', KEYS[2], tostring(job), ARGV[1])\n\
-        \  return job\n\
-        \else\n\
-        \  return nil\n\
-        \end"
-        [jobQueue hw, progressQueue hw]
-        [LB.toStrict $ A.encode now]
+      R.brpop [priorityQueue hw, jobQueue hw] 60 >>=
+        \case
+          Left err -> do
+            liftIO $ hwlog hw err
+            return Nothing
 
-  case eitherReply of
-    Left err ->
-      hwlog hw err >> delayAndRun
+          Right Nothing ->
+            return Nothing
 
-    Right Nothing ->
-      delayAndRun
+          Right (Just (_, t)) -> do
+            now <- liftIO getCurrentTime
+            R.hset (progressQueue hw) t $ LB.toStrict $ A.encode now
+            return $ Just t
 
-    Right (Just t) -> do
-      when (hworkerDebug hw) $  hwlog hw ("WORKER RUNNING" :: Text, t)
+    --   R.eval
+    --     "local job = redis.call('brpop', KEYS[1], KEYS[2], ARGV[2])\n\
+    --     \if job then\n\
+    --     \  redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
+    --     \  return job\n\
+    --     \else\n\
+    --     \  return nil\n\
+    --     \end"
+    --     [priorityQueue hw, jobQueue hw, progressQueue hw]
+    --     [LB.toStrict $ A.encode now, "30.0"]
+    -- :: IO (Either R.Reply (Maybe (ByteString, ByteString)))
+
+  case result of
+    Nothing ->
+      justRun
+
+    Just t -> do
+      now <- getCurrentTime
+      runRedis (hworkerConnection hw)
+        $ R.hset (progressQueue hw) t
+        $ LB.toStrict
+        $ A.encode now
+
+      when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING" :: Text, t)
 
       case A.decodeStrict t of
         Nothing -> do
@@ -852,7 +871,7 @@ worker hw =
               [progressQueue hw, brokenQueue hw]
               [t, LB.toStrict $ A.encode now']
 
-          delayAndRun
+          justRun
 
         Just (JobRef _ maybeBatch maybeCron, j) ->
           let
@@ -872,11 +891,11 @@ worker hw =
                         $ R.hdel (progressQueue hw) [t]
                     nextCron
                     case deletionResult of
-                      Left err -> hwlog hw err >> delayAndRun
+                      Left err -> hwlog hw err >> justRun
                       Right 1  -> justRun
                       Right n  -> do
                         hwlog hw ("Job done: did not delete 1, deleted " <> show n)
-                        delayAndRun
+                        justRun
 
                   Just batch ->
                     runWithMaybe hw
@@ -902,7 +921,7 @@ worker hw =
                           case decodeBatchSummary batch hm of
                             Nothing -> do
                               hwlog hw ("Job done: did not delete 1" :: Text)
-                              delayAndRun
+                              justRun
 
                             Just summary -> do
                               when (batchSummaryStatus summary == BatchFinished)
@@ -922,7 +941,7 @@ worker hw =
                         \  redis.call('lpush', KEYS[2], ARGV[1])\n\
                         \end\n\
                         \return nil"
-                        [progressQueue hw, jobQueue hw]
+                        [progressQueue hw, priorityQueue hw]
                         [t]
 
                   Just batch ->
@@ -934,10 +953,10 @@ worker hw =
                         \  redis.call('hincrby', KEYS[3], 'retries', '1')\n\
                         \end\n\
                         \return nil"
-                        [progressQueue hw, jobQueue hw, batchCounter hw batch]
+                        [progressQueue hw, priorityQueue hw, batchCounter hw batch]
                         [t]
 
-                delayAndRun
+                justRun
 
               Failure msg -> do
                 hwlog hw ("Failure: " <> msg)
@@ -982,7 +1001,7 @@ worker hw =
                       )
 
                 nextCron
-                delayAndRun
+                justRun
 
 
 -- | Start a scheduler. Like 'worker', this is blocking, so should be
@@ -1009,7 +1028,7 @@ scheduler hw =
           \end\n\
           \return nil"
           [ scheduleQueue hw
-          , jobQueue hw
+          , priorityQueue hw
           , cronProcessing hw
           ]
           [ B8.pack $ show (utcToDouble now) ]
@@ -1046,7 +1065,7 @@ monitor hw =
                     \  redis.call('rpush', KEYS[1], ARGV[1])\n\
                     \end\n\
                     \return del"
-                    [jobQueue hw, progressQueue hw]
+                    [priorityQueue hw, progressQueue hw]
                     [j]
               when (hworkerDebug hw)
                 $ hwlog hw ("MONITOR RV" :: Text, n)
@@ -1078,7 +1097,9 @@ broken hw =
 
 listJobs :: Job s t => Hworker s t -> Integer -> Integer -> IO [t]
 listJobs hw offset limit =
-  listJobsFromQueue hw (jobQueue hw) offset limit
+  (<>)
+    <$> listJobsFromQueue hw (priorityQueue hw) offset limit
+    <*> listJobsFromQueue hw (jobQueue hw) offset limit
 
 
 listJobsFromQueue ::
@@ -1156,8 +1177,10 @@ debugger microseconds hw =
   forever $ do
     runWithList hw (R.hkeys (progressQueue hw)) $
       \running ->
-        runWithList hw (R.lrange (jobQueue hw) 0 (-1))
-          $ \queued -> hwlog hw ("DEBUG" :: Text, queued, running)
+        runWithList hw (R.lrange (priorityQueue hw) 0 (-1)) $
+          \priority ->
+            runWithList hw (R.lrange (jobQueue hw) 0 (-1)) $
+              \queued -> hwlog hw ("DEBUG" :: Text, priority, queued, running)
 
     threadDelay microseconds
 
