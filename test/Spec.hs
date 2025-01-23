@@ -83,6 +83,20 @@ main = hspec $ do
       v <- takeMVar mvar
       assertEqual "State should be 1000 after 1000 job runs" 1000 v
 
+  describe "Priority Jobs" $ do
+    it "should execute priority jobs before standard ones" $ do
+      mvar <- newMVar []
+      hworker <- createWith (conf "priority-worker" (PriorityState mvar))
+      queue hworker $ PriorityJob "b"
+      queue hworker $ PriorityJob "c"
+      queuePriority hworker $ PriorityJob "a"
+      wthread <- forkIO (worker hworker)
+      threadDelay 50000
+      killThread wthread
+      destroy hworker
+      v <- takeMVar mvar
+      assertEqual "State should be [c,b,a] after job runs" ["c","b","a"] v
+
   describe "Exceptions" $ do
     it "should be able to have exceptions thrown in jobs and retry the job" $ do
       mvar <- newMVar 0
@@ -745,6 +759,21 @@ instance Job TimedState TimedJob where
   job Hworker { hworkerState = TimedState mvar } (TimedJob delay) = do
     threadDelay delay
     modifyMVarMasked_ mvar (return . (+1))
+    return Success
+
+
+data PriorityJob =
+  PriorityJob Text deriving (Generic, Show, Eq)
+
+instance ToJSON PriorityJob
+instance FromJSON PriorityJob
+
+newtype PriorityState =
+  PriorityState (MVar [Text])
+
+instance Job PriorityState PriorityJob where
+  job Hworker { hworkerState = PriorityState mvar } (PriorityJob val) = do
+    modifyMVarMasked_ mvar (return . (val:))
     return Success
 
 
