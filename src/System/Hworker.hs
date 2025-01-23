@@ -69,6 +69,7 @@ module System.Hworker
   , monitor
     -- * Queuing Jobs
   , queue
+  , queuePriority
   , queueScheduled
   , queueBatch
   , streamBatch
@@ -495,12 +496,24 @@ cronId cron =
 
 -- | Adds a job to the queue. Returns whether the operation succeeded.
 
-queue :: Job s t => Hworker s t -> Bool -> t -> IO Bool
-queue hw priority j = do
+queue :: Job s t => Hworker s t -> t -> IO Bool
+queue hw j = do
   jobId <- UUID.toText <$> UUID.nextRandom
   result <-
     runRedis (hworkerConnection hw)
-      $ R.lpush (if priority then priorityQueue hw else jobQueue hw)
+      $ R.lpush (jobQueue hw)
+      $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
+  return $ isRight result
+
+
+-- | Adds a job to the priority queue. Returns whether the operation succeeded.
+
+queuePriority :: Job s t => Hworker s t -> t -> IO Bool
+queuePriority hw j = do
+  jobId <- UUID.toText <$> UUID.nextRandom
+  result <-
+    runRedis (hworkerConnection hw)
+      $ R.lpush (priorityQueue hw)
       $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
   return $ isRight result
 
@@ -786,6 +799,9 @@ stopBatchQueueing hw batch =
 worker :: Job s t => Hworker s t -> IO ()
 worker hw =
   let
+    delayAndRun =
+      threadDelay 10000 >> worker hw
+
     justRun =
       worker hw
 
@@ -815,45 +831,32 @@ worker hw =
         Right result ->
           return result
   in do
-  result <-
+  now <- getCurrentTime
+
+  eitherReply <-
+    -- NOTE(rjbf 2025-01-23): We're using `brpop` here just to get a job from
+    -- either of the job queues. Blocking commands do not actually block
+    -- inside Redis transactions so the timeout here has no effect.
     runRedis (hworkerConnection hw) $
-      R.brpop [priorityQueue hw, jobQueue hw] 60 >>=
-        \case
-          Left err -> do
-            liftIO $ hwlog hw err
-            return Nothing
+      R.eval
+        "local job = redis.call('brpop', KEYS[1], KEYS[2], '0.0001')\n\
+        \if job then\n\
+        \  redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
+        \  return job[2]\n\
+        \else\n\
+        \  return nil\n\
+        \end"
+        [priorityQueue hw, jobQueue hw, progressQueue hw]
+        [LB.toStrict $ A.encode now]
 
-          Right Nothing ->
-            return Nothing
+  case eitherReply of
+    Left err -> do
+      hwlog hw err >> delayAndRun
 
-          Right (Just (_, t)) -> do
-            now <- liftIO getCurrentTime
-            R.hset (progressQueue hw) t $ LB.toStrict $ A.encode now
-            return $ Just t
+    Right Nothing ->
+      delayAndRun
 
-    --   R.eval
-    --     "local job = redis.call('brpop', KEYS[1], KEYS[2], ARGV[2])\n\
-    --     \if job then\n\
-    --     \  redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
-    --     \  return job\n\
-    --     \else\n\
-    --     \  return nil\n\
-    --     \end"
-    --     [priorityQueue hw, jobQueue hw, progressQueue hw]
-    --     [LB.toStrict $ A.encode now, "30.0"]
-    -- :: IO (Either R.Reply (Maybe (ByteString, ByteString)))
-
-  case result of
-    Nothing ->
-      justRun
-
-    Just t -> do
-      now <- getCurrentTime
-      runRedis (hworkerConnection hw)
-        $ R.hset (progressQueue hw) t
-        $ LB.toStrict
-        $ A.encode now
-
+    Right (Just t) -> do
       when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING" :: Text, t)
 
       case A.decodeStrict t of
@@ -871,7 +874,7 @@ worker hw =
               [progressQueue hw, brokenQueue hw]
               [t, LB.toStrict $ A.encode now']
 
-          justRun
+          delayAndRun
 
         Just (JobRef _ maybeBatch maybeCron, j) ->
           let
@@ -891,11 +894,11 @@ worker hw =
                         $ R.hdel (progressQueue hw) [t]
                     nextCron
                     case deletionResult of
-                      Left err -> hwlog hw err >> justRun
+                      Left err -> hwlog hw err >> delayAndRun
                       Right 1  -> justRun
                       Right n  -> do
                         hwlog hw ("Job done: did not delete 1, deleted " <> show n)
-                        justRun
+                        delayAndRun
 
                   Just batch ->
                     runWithMaybe hw
@@ -921,7 +924,7 @@ worker hw =
                           case decodeBatchSummary batch hm of
                             Nothing -> do
                               hwlog hw ("Job done: did not delete 1" :: Text)
-                              justRun
+                              delayAndRun
 
                             Just summary -> do
                               when (batchSummaryStatus summary == BatchFinished)
@@ -941,7 +944,7 @@ worker hw =
                         \  redis.call('lpush', KEYS[2], ARGV[1])\n\
                         \end\n\
                         \return nil"
-                        [progressQueue hw, priorityQueue hw]
+                        [progressQueue hw, jobQueue hw]
                         [t]
 
                   Just batch ->
@@ -953,10 +956,10 @@ worker hw =
                         \  redis.call('hincrby', KEYS[3], 'retries', '1')\n\
                         \end\n\
                         \return nil"
-                        [progressQueue hw, priorityQueue hw, batchCounter hw batch]
+                        [progressQueue hw, jobQueue hw, batchCounter hw batch]
                         [t]
 
-                justRun
+                delayAndRun
 
               Failure msg -> do
                 hwlog hw ("Failure: " <> msg)
@@ -1001,7 +1004,7 @@ worker hw =
                       )
 
                 nextCron
-                justRun
+                delayAndRun
 
 
 -- | Start a scheduler. Like 'worker', this is blocking, so should be
@@ -1065,7 +1068,7 @@ monitor hw =
                     \  redis.call('rpush', KEYS[1], ARGV[1])\n\
                     \end\n\
                     \return del"
-                    [priorityQueue hw, progressQueue hw]
+                    [jobQueue hw, progressQueue hw]
                     [j]
               when (hworkerDebug hw)
                 $ hwlog hw ("MONITOR RV" :: Text, n)

@@ -34,7 +34,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
-      queue hworker False SimpleJob
+      queue hworker SimpleJob
       threadDelay 30000
       killThread wthread
       destroy hworker
@@ -45,8 +45,8 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-2" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
-      queue hworker False SimpleJob
-      queue hworker False SimpleJob
+      queue hworker SimpleJob
+      queue hworker SimpleJob
       threadDelay 40000
       killThread wthread
       destroy hworker
@@ -57,7 +57,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-3" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
-      replicateM_ 1000 (queue hworker False SimpleJob)
+      replicateM_ 1000 (queue hworker SimpleJob)
       threadDelay 2000000
       killThread wthread
       destroy hworker
@@ -73,7 +73,7 @@ main = hspec $ do
       wthread2 <- forkIO (worker hworker)
       wthread3 <- forkIO (worker hworker)
       wthread4 <- forkIO (worker hworker)
-      replicateM_ 1000 (queue hworker False SimpleJob)
+      replicateM_ 1000 (queue hworker SimpleJob)
       threadDelay 1000000
       killThread wthread1
       killThread wthread2
@@ -91,7 +91,7 @@ main = hspec $ do
           (conf "exworker-1" (ExState mvar))
             { hwconfigExceptionBehavior = RetryOnException }
       wthread <- forkIO (worker hworker)
-      queue hworker False ExJob
+      queue hworker ExJob
       threadDelay 1000000
       killThread wthread
       destroy hworker
@@ -103,7 +103,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "exworker-2" (ExState mvar))
       wthread <- forkIO (worker hworker)
-      queue hworker False ExJob
+      queue hworker ExJob
       threadDelay 30000
       killThread wthread
       destroy hworker
@@ -115,7 +115,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "retryworker-1" (RetryState mvar))
       wthread <- forkIO (worker hworker)
-      queue hworker False RetryJob
+      queue hworker RetryJob
       threadDelay 50000
       killThread wthread
       destroy hworker
@@ -127,7 +127,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "failworker-1" (FailState mvar))
       wthread <- forkIO (worker hworker)
-      queue hworker False FailJob
+      queue hworker FailJob
       threadDelay 30000
       killThread wthread
       destroy hworker
@@ -138,7 +138,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "failworker-2" (FailState mvar))
       wthread <- forkIO (worker hworker)
-      queue hworker False FailJob
+      queue hworker FailJob
       threadDelay 30000
       killThread wthread
       failedJobs <- listFailed hworker 0 100
@@ -152,10 +152,10 @@ main = hspec $ do
           (conf "failworker-3" (AlwaysFailState mvar))
             { hwconfigFailedQueueSize = 2 }
       wthread <- forkIO (worker hworker)
-      queue hworker False AlwaysFailJob
-      queue hworker False AlwaysFailJob
-      queue hworker False AlwaysFailJob
-      queue hworker False AlwaysFailJob
+      queue hworker AlwaysFailJob
+      queue hworker AlwaysFailJob
+      queue hworker AlwaysFailJob
+      queue hworker AlwaysFailJob
       threadDelay 100000
       killThread wthread
       failedJobs <- listFailed hworker 0 100
@@ -402,7 +402,7 @@ main = hspec $ do
           (conf "timedworker-1" (TimedState mvar)) { hwconfigTimeout = 5 }
       wthread1 <- forkIO (worker hworker)
       mthread <- forkIO (monitor hworker)
-      queue hworker False (TimedJob 1000000)
+      queue hworker (TimedJob 1000000)
       threadDelay 500000
       killThread wthread1
       wthread2 <- forkIO (worker hworker)
@@ -424,8 +424,8 @@ main = hspec $ do
       wthread1 <- forkIO (worker hworker)
       wthread2 <- forkIO (worker hworker)
       mthread <- forkIO (monitor hworker)
-      queue hworker False (TimedJob 1000000)
-      queue hworker False (TimedJob 1000000)
+      queue hworker (TimedJob 1000000)
+      queue hworker (TimedJob 1000000)
       threadDelay 500000
       killThread wthread1
       killThread wthread2
@@ -452,8 +452,8 @@ main = hspec $ do
       mthread4 <- forkIO (monitor hworker)
       mthread5 <- forkIO (monitor hworker)
       mthread6 <- forkIO (monitor hworker)
-      queue hworker False (TimedJob 1000000)
-      queue hworker False (TimedJob 1000000)
+      queue hworker (TimedJob 1000000)
+      queue hworker (TimedJob 1000000)
       threadDelay 500000
       killThread wthread1
       killThread wthread2
@@ -571,7 +571,7 @@ main = hspec $ do
     it "should list pending jobs" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      replicateM_ 45 (queue hworker False SimpleJob)
+      replicateM_ 45 (queue hworker SimpleJob)
       listJobs hworker 0 10 >>= shouldBe 10 . length
       listJobs hworker 1 10 >>= shouldBe 10 . length
       listJobs hworker 2 10 >>= shouldBe 10 . length
@@ -602,7 +602,7 @@ main = hspec $ do
       hworker1 <- createWith (conf "broken-1" (TimedState mvar)) { hwconfigTimeout = 5 }
       hworker2 <- createWith (conf "broken-1" (SimpleState mvar)) { hwconfigTimeout = 5 }
       wthread <- forkIO (worker hworker1)
-      queue hworker2 False SimpleJob
+      queue hworker2 SimpleJob
       threadDelay 100000
       brokenJobs <- broken hworker2
       killThread wthread
@@ -615,7 +615,7 @@ main = hspec $ do
     it "should return the job that was queued" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "dump-1" (SimpleState mvar)) { hwconfigTimeout = 5 }
-      queue hworker False SimpleJob
+      queue hworker SimpleJob
       res <- listJobs hworker 0 100
       destroy hworker
       assertEqual "Should be [SimpleJob]" [SimpleJob] res
@@ -623,8 +623,8 @@ main = hspec $ do
     it "should return jobs in order (most recently added at front; worker pulls from back)" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "dump-2" (TimedState mvar)) { hwconfigTimeout = 5 }
-      queue hworker False (TimedJob 1)
-      queue hworker False (TimedJob 2)
+      queue hworker (TimedJob 1)
+      queue hworker (TimedJob 2)
       res <- listJobs hworker 0 100
       destroy hworker
       assertEqual "Should by [TimedJob 2, TimedJob 1]" [TimedJob 2, TimedJob 1] res
@@ -638,7 +638,7 @@ main = hspec $ do
       wthread3 <- forkIO (worker hworker)
       wthread4 <- forkIO (worker hworker)
       let content = T.intercalate "\n" (take 1000 (repeat "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
-      replicateM_ 5000 (queue hworker False (BigJob content))
+      replicateM_ 5000 (queue hworker (BigJob content))
       threadDelay 10000000
       killThread wthread1
       killThread wthread2
