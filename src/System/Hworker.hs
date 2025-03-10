@@ -69,6 +69,7 @@ module System.Hworker
   , monitor
     -- * Queuing Jobs
   , queue
+  , queuePriority
   , queueScheduled
   , queueBatch
   , streamBatch
@@ -433,6 +434,7 @@ destroy hw =
 
     R.del
       [ jobQueue hw
+      , priorityQueue hw
       , progressQueue hw
       , brokenQueue hw
       , failedQueue hw
@@ -445,6 +447,11 @@ destroy hw =
 jobQueue :: Hworker s t -> ByteString
 jobQueue hw =
   "hworker-jobs-" <> hworkerName hw
+
+
+priorityQueue :: Hworker s t -> ByteString
+priorityQueue hw =
+  "hworker-priority-jobs-" <> hworkerName hw
 
 
 progressQueue :: Hworker s t -> ByteString
@@ -495,6 +502,18 @@ queue hw j = do
   result <-
     runRedis (hworkerConnection hw)
       $ R.lpush (jobQueue hw)
+      $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
+  return $ isRight result
+
+
+-- | Adds a job to the priority queue. Returns whether the operation succeeded.
+
+queuePriority :: Job s t => Hworker s t -> t -> IO Bool
+queuePriority hw j = do
+  jobId <- UUID.toText <$> UUID.nextRandom
+  result <-
+    runRedis (hworkerConnection hw)
+      $ R.lpush (priorityQueue hw)
       $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
   return $ isRight result
 
@@ -815,27 +834,30 @@ worker hw =
   now <- getCurrentTime
 
   eitherReply <-
+    -- NOTE(rjbf 2025-01-23): We're using `brpop` here just to get a job from
+    -- either of the job queues. Blocking commands do not actually block
+    -- inside Redis transactions so the timeout here has no effect.
     runRedis (hworkerConnection hw) $
       R.eval
-        "local job = redis.call('rpop',KEYS[1])\n\
-        \if job ~= nil then\n\
-        \  redis.call('hset', KEYS[2], tostring(job), ARGV[1])\n\
-        \  return job\n\
+        "local job = redis.call('brpop', KEYS[1], KEYS[2], '0.0001')\n\
+        \if job then\n\
+        \  redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
+        \  return job[2]\n\
         \else\n\
         \  return nil\n\
         \end"
-        [jobQueue hw, progressQueue hw]
+        [priorityQueue hw, jobQueue hw, progressQueue hw]
         [LB.toStrict $ A.encode now]
 
   case eitherReply of
-    Left err ->
+    Left err -> do
       hwlog hw err >> delayAndRun
 
     Right Nothing ->
       delayAndRun
 
     Right (Just t) -> do
-      when (hworkerDebug hw) $  hwlog hw ("WORKER RUNNING" :: Text, t)
+      when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING" :: Text, t)
 
       case A.decodeStrict t of
         Nothing -> do
@@ -1009,7 +1031,7 @@ scheduler hw =
           \end\n\
           \return nil"
           [ scheduleQueue hw
-          , jobQueue hw
+          , priorityQueue hw
           , cronProcessing hw
           ]
           [ B8.pack $ show (utcToDouble now) ]
@@ -1078,7 +1100,9 @@ broken hw =
 
 listJobs :: Job s t => Hworker s t -> Integer -> Integer -> IO [t]
 listJobs hw offset limit =
-  listJobsFromQueue hw (jobQueue hw) offset limit
+  (<>)
+    <$> listJobsFromQueue hw (priorityQueue hw) offset limit
+    <*> listJobsFromQueue hw (jobQueue hw) offset limit
 
 
 listJobsFromQueue ::
@@ -1156,8 +1180,10 @@ debugger microseconds hw =
   forever $ do
     runWithList hw (R.hkeys (progressQueue hw)) $
       \running ->
-        runWithList hw (R.lrange (jobQueue hw) 0 (-1))
-          $ \queued -> hwlog hw ("DEBUG" :: Text, queued, running)
+        runWithList hw (R.lrange (priorityQueue hw) 0 (-1)) $
+          \priority ->
+            runWithList hw (R.lrange (jobQueue hw) 0 (-1)) $
+              \queued -> hwlog hw ("DEBUG" :: Text, priority, queued, running)
 
     threadDelay microseconds
 
