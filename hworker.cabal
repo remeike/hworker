@@ -37,6 +37,7 @@ Test-Suite hworker-test
                        -fno-warn-unused-do-bind
   build-depends:       base >= 4.7 && < 5
                      , aeson
+                     , async
                      , hedis >= 0.6.5
                      , text
                      , bytestring
