@@ -807,8 +807,8 @@ worker hw =
     execWorker hw >>=
       \case
         NoJobs         -> threadDelay 10000
-        DequeueError _ -> return ()
-        BrokenJob _    -> return ()
+        DequeueError _ -> threadDelay 10000
+        BrokenJob _    -> threadDelay 10000
         JobDone _ _    -> return ()
 
 
@@ -1091,11 +1091,18 @@ monitor hw =
     threadDelay (floor $ 100000 * hworkerJobTimeout hw)
 
 
+-- | The status of a job found in the progress queue.
+
 data JobProgress
   = Running NominalDiffTime
   | Requeued
   deriving (Eq, Show)
 
+
+-- | Checks how long each job in the progress queue has been running
+-- and returns their progress. Any job that that has timed out is added back to
+-- the progress queue to be retried. Like `execWorker` and `execScheduler`,
+-- this can also be useful for testing.
 
 execMonitor :: Job s t => Hworker s t -> IO [(ByteString, JobProgress)]
 execMonitor hw = do
