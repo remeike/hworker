@@ -6,6 +6,7 @@
 
 --------------------------------------------------------------------------------
 import           Control.Concurrent       ( forkIO, killThread, threadDelay )
+import           Control.Concurrent.Async ( mapConcurrently_ )
 import           Control.Concurrent.MVar  ( MVar, modifyMVarMasked_, newMVar
                                           , readMVar, takeMVar
                                           )
@@ -33,10 +34,8 @@ main = hspec $ do
     it "should run and increment counter" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       queue hworker SimpleJob
-      threadDelay 30000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 1 after job runs" 1 v
@@ -44,11 +43,9 @@ main = hspec $ do
     it "queueing 2 jobs should increment twice" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-2" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       queue hworker SimpleJob
       queue hworker SimpleJob
-      threadDelay 40000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 2 after 2 jobs run" 2 v
@@ -56,10 +53,8 @@ main = hspec $ do
     it "queueing 1000 jobs should increment 1000" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-3" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       replicateM_ 1000 (queue hworker SimpleJob)
-      threadDelay 2000000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 1000 after 1000 job runs" 1000 v
@@ -69,16 +64,8 @@ main = hspec $ do
       -- they are all blocking on the MVar, but that's not the point.
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-4" (SimpleState mvar))
-      wthread1 <- forkIO (worker hworker)
-      wthread2 <- forkIO (worker hworker)
-      wthread3 <- forkIO (worker hworker)
-      wthread4 <- forkIO (worker hworker)
       replicateM_ 1000 (queue hworker SimpleJob)
-      threadDelay 1000000
-      killThread wthread1
-      killThread wthread2
-      killThread wthread3
-      killThread wthread4
+      mapConcurrently_ runJobs [hworker, hworker, hworker, hworker]
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 1000 after 1000 job runs" 1000 v
@@ -90,9 +77,7 @@ main = hspec $ do
       queue hworker $ PriorityJob "b"
       queue hworker $ PriorityJob "c"
       queuePriority hworker $ PriorityJob "a"
-      wthread <- forkIO (worker hworker)
-      threadDelay 50000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be [c,b,a] after job runs" ["c","b","a"] v
@@ -104,10 +89,9 @@ main = hspec $ do
         createWith
           (conf "exworker-1" (ExState mvar))
             { hwconfigExceptionBehavior = RetryOnException }
-      wthread <- forkIO (worker hworker)
+
       queue hworker ExJob
-      threadDelay 1000000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       listJobs hworker 0 10
@@ -116,10 +100,8 @@ main = hspec $ do
     it "should not retry if mode is FailOnException" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "exworker-2" (ExState mvar))
-      wthread <- forkIO (worker hworker)
       queue hworker ExJob
-      threadDelay 30000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 1, since failing run wasn't retried" 1 v
@@ -128,10 +110,8 @@ main = hspec $ do
     it "should be able to return Retry and get run again" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "retryworker-1" (RetryState mvar))
-      wthread <- forkIO (worker hworker)
       queue hworker RetryJob
-      threadDelay 50000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 2, since it got retried" 2 v
@@ -140,10 +120,8 @@ main = hspec $ do
     it "should not retry a job that Fails" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "failworker-1" (FailState mvar))
-      wthread <- forkIO (worker hworker)
       queue hworker FailJob
-      threadDelay 30000
-      killThread wthread
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 1, since failing run wasn't retried" 1 v
@@ -151,10 +129,8 @@ main = hspec $ do
     it "should put a failed job into the failed queue" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "failworker-2" (FailState mvar))
-      wthread <- forkIO (worker hworker)
       queue hworker FailJob
-      threadDelay 30000
-      killThread wthread
+      runJobs hworker
       failedJobs <- listFailed hworker 0 100
       destroy hworker
       assertEqual "Should have failed job" [FailJob] failedJobs
@@ -165,13 +141,11 @@ main = hspec $ do
         createWith
           (conf "failworker-3" (AlwaysFailState mvar))
             { hwconfigFailedQueueSize = 2 }
-      wthread <- forkIO (worker hworker)
       queue hworker AlwaysFailJob
       queue hworker AlwaysFailJob
       queue hworker AlwaysFailJob
       queue hworker AlwaysFailJob
-      threadDelay 100000
-      killThread wthread
+      runJobs hworker
       failedJobs <- listFailed hworker 0 100
       destroy hworker
       v <- takeMVar mvar
@@ -212,50 +186,44 @@ main = hspec $ do
     it "should not enqueue job for completed batch" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
       queueBatch hworker batch False [SimpleJob]
-      threadDelay 30000
+      runJobs hworker
       stopBatchQueueing hworker batch
       summary <- expectBatchSummary hworker batch
       queueBatch hworker batch False [SimpleJob]
         >>= shouldBe (AlreadyQueued summary)
-      threadDelay 30000
+      runJobs hworker
       summary' <- expectBatchSummary hworker batch
       batchSummaryQueued summary' `shouldBe` 1
-      killThread wthread
       destroy hworker
 
     it "should increment success and completed after completing a successful batch job" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
       queueBatch hworker batch False [SimpleJob]
-      threadDelay 30000
+      runJobs hworker
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
       batchSummaryFailures summary `shouldBe` 0
       batchSummarySuccesses summary `shouldBe` 1
       batchSummaryCompleted summary `shouldBe` 1
       batchSummaryStatus summary `shouldBe` BatchQueueing
-      killThread wthread
       destroy hworker
 
     it "should increment failure and completed after completing a failed batch job" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "failworker-1" (FailState mvar))
-      wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
       queueBatch hworker batch False [FailJob]
-      threadDelay 30000
+      runJobs hworker
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
       batchSummaryFailures summary `shouldBe` 1
       batchSummarySuccesses summary `shouldBe` 0
       batchSummaryCompleted summary `shouldBe` 1
       batchSummaryStatus summary `shouldBe` BatchQueueing
-      killThread wthread
       destroy hworker
 
     it "should change job status to processing when batch is set to stop queueing" $ do
@@ -272,39 +240,34 @@ main = hspec $ do
     it "should change job status to finished when batch is set to stop queueing and jobs are already run" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
       queueBatch hworker batch False [SimpleJob]
-      threadDelay 30000
+      runJobs hworker
       stopBatchQueueing hworker batch
       Just batch' <- batchSummary hworker batch
       batchSummaryQueued batch' `shouldBe` 1
       batchSummaryStatus batch' `shouldBe` BatchFinished
-      killThread wthread
       destroy hworker
 
     it "should change job status to finished when last processed" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
       queueBatch hworker batch False [SimpleJob]
       stopBatchQueueing hworker batch
-      threadDelay 30000
+      runJobs hworker
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
       batchSummaryStatus summary `shouldBe` BatchFinished
-      killThread wthread
       destroy hworker
 
     it "queueing 1000 jobs should increment 1000" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-3" (SimpleState mvar))
-      wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
       queueBatch hworker batch False (replicate 1000 SimpleJob)
       stopBatchQueueing hworker batch
-      threadDelay 2000000
+      runJobs hworker
       v <- takeMVar mvar
       v `shouldBe` 1000
       summary <- expectBatchSummary hworker batch
@@ -313,7 +276,6 @@ main = hspec $ do
       batchSummarySuccesses summary `shouldBe` 1000
       batchSummaryCompleted summary `shouldBe` 1000
       batchSummaryStatus summary `shouldBe` BatchFinished
-      killThread wthread
       destroy hworker
 
     describe "Atomicity Tests" $ do
@@ -373,110 +335,109 @@ main = hspec $ do
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
 
-        thread <-
-          forkIO . void . streamBatch hworker batch True $ do
-            replicateM_ 5 $
-              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
-            error "BLOW UP!"
-            replicateM_ 5 $
-              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
-            return StreamingOk
+        void $ streamBatch hworker batch True $ do
+          replicateM_ 5 $ Conduit.yield SimpleJob
+          error "BLOW UP!"
+          replicateM_ 5 $ Conduit.yield SimpleJob
+          return StreamingOk
 
-        threadDelay 190000
-        summary1 <- expectBatchSummary hworker batch
-        batchSummaryQueued summary1 `shouldBe` 4
+        summary <- expectBatchSummary hworker batch
+        batchSummaryQueued summary `shouldBe` 5
+        batchSummaryStatus summary `shouldBe` BatchFailed
         ls <- listJobs hworker 0 100
         length ls `shouldBe` 0
-        threadDelay 100000
-        summary2 <- expectBatchSummary hworker batch
-        batchSummaryQueued summary2 `shouldBe` 5
-        batchSummaryStatus summary2 `shouldBe` BatchFailed
-        killThread thread
         destroy hworker
-
 
   describe "Monitor" $ do
     it "should add job back after timeout" $ do
-      -- NOTE(dbp 2015-07-12): The timing on this test is somewhat
-      -- tricky.  We want to get the job started with one worker,
-      -- then kill the worker, then start a new worker, and have
-      -- the monitor put the job back in the queue and have the
-      -- second worker finish it. It's important that the job
-      -- takes less time to complete than the timeout for the
-      -- monitor, or else it'll queue it forever.
-      --
-      -- The timeout is 5 seconds. The job takes 1 seconds to run.
-      -- The worker is killed after 0.5 seconds, which should be
-      -- plenty of time for it to have started the job. Then after
-      -- the second worker is started, we wait 10 seconds, which
-      -- should be plenty; we expect the total run to take around 11.
       mvar <- newMVar 0
       hworker <-
         createWith
-          (conf "timedworker-1" (TimedState mvar)) { hwconfigTimeout = 5 }
-      wthread1 <- forkIO (worker hworker)
-      mthread <- forkIO (monitor hworker)
+          (conf "timedworker-1" (TimedState mvar)) { hwconfigTimeout = 2 }
+      wthread <- forkIO (worker hworker)
       queue hworker (TimedJob 1000000)
       threadDelay 500000
-      killThread wthread1
-      wthread2 <- forkIO (worker hworker)
-      threadDelay 10000000
-      v <- takeMVar mvar
-      killThread wthread2
-      killThread mthread
+      -- Kill the worker thread before the job can even finish, leaving the job
+      -- in the progress queue.
+      killThread wthread
+
+
+      -- Monitor should show that job is still in progress queue and has been
+      -- running a half second.
+      execMonitor hworker >>=
+        \case
+          [(_, Running _)] -> return ()
+          _ -> fail "There should one running job."
+
+      -- Delay further to pass the the timeout.
+      threadDelay 2000000
+
+      -- Run monitor again to put requeue job.
+      execMonitor hworker >>=
+        \case
+          [(_, Requeued)] -> return ()
+          _ -> fail "There should be one requeued job."
+
+      -- Run worker again, this time allowing job to complete.
+      execWorker hworker
+      jobs <- execMonitor hworker
       destroy hworker
+      assertEqual "Should no longer be job a job in progress queue" [] jobs
+      v <- takeMVar mvar
       assertEqual "State should be 1, since first failed" 1 v
 
     it "should add back multiple jobs after timeout" $ do
-      -- NOTE(dbp 2015-07-23): Similar to the above test, but we
-      -- have multiple jobs started, multiple workers killed.
-      -- then one worker will finish both interrupted jobs.
+      -- Similar to the above test, but we have multiple jobs started, multiple
+      -- workers killed, then one worker will finish both interrupted jobs.
       mvar <- newMVar 0
       hworker <-
         createWith
-          (conf "timedworker-2" (TimedState mvar)) { hwconfigTimeout = 5 }
+          (conf "timedworker-2" (TimedState mvar)) { hwconfigTimeout = 2 }
       wthread1 <- forkIO (worker hworker)
       wthread2 <- forkIO (worker hworker)
-      mthread <- forkIO (monitor hworker)
       queue hworker (TimedJob 1000000)
       queue hworker (TimedJob 1000000)
       threadDelay 500000
       killThread wthread1
       killThread wthread2
-      wthread3 <- forkIO (worker hworker)
-      threadDelay 10000000
+
+      execMonitor hworker >>=
+        \case
+          [(_, Running _), (_, Running _)] -> return ()
+          _ -> fail "Should be two running jobs"
+
+      threadDelay 2000000
+      execMonitor hworker >>=
+        \case
+          [(_, Requeued), (_, Requeued)] -> return ()
+          _ -> fail "There should be two requeued jobs."
+
+      runJobs hworker
+      jobs <- execMonitor hworker
       destroy hworker
+      assertEqual "Should no longer be job a job in progress queue" [] jobs
       v <- takeMVar mvar
-      killThread wthread3
-      killThread mthread
       assertEqual "State should be 2, since first 2 failed" 2 v
 
     it "should work with multiple monitors" $ do
       mvar <- newMVar 0
       hworker <-
         createWith
-          (conf "timedworker-3" (TimedState mvar)) { hwconfigTimeout = 5 }
+          (conf "timedworker-3" (TimedState mvar)) { hwconfigTimeout = 2 }
       wthread1 <- forkIO (worker hworker)
       wthread2 <- forkIO (worker hworker)
       -- NOTE(dbp 2015-07-24): This might seem silly, but it
       -- was actually sufficient to expose a race condition.
-      mthread1 <- forkIO (monitor hworker)
-      mthread2 <- forkIO (monitor hworker)
-      mthread3 <- forkIO (monitor hworker)
-      mthread4 <- forkIO (monitor hworker)
-      mthread5 <- forkIO (monitor hworker)
-      mthread6 <- forkIO (monitor hworker)
       queue hworker (TimedJob 1000000)
       queue hworker (TimedJob 1000000)
       threadDelay 500000
       killThread wthread1
       killThread wthread2
-      wthread3 <- forkIO (worker hworker)
-      threadDelay 30000000
+      threadDelay 2000000
+      mapConcurrently_ execMonitor [hworker, hworker, hworker, hworker, hworker, hworker]
+      runJobs hworker
       destroy hworker
       v <- takeMVar mvar
-      killThread wthread3
-      mapM_ killThread [mthread1, mthread2, mthread3, mthread4, mthread5, mthread6]
       assertEqual "State should be 2, since first 2 failed" 2 v
       -- NOTE(dbp 2015-07-24): It would be really great to have a
       -- test that went after a race between the retry logic and
@@ -615,11 +576,9 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker1 <- createWith (conf "broken-1" (TimedState mvar)) { hwconfigTimeout = 5 }
       hworker2 <- createWith (conf "broken-1" (SimpleState mvar)) { hwconfigTimeout = 5 }
-      wthread <- forkIO (worker hworker1)
       queue hworker2 SimpleJob
-      threadDelay 100000
+      runJobs hworker1
       brokenJobs <- broken hworker2
-      killThread wthread
       destroy hworker1
       v <- takeMVar mvar
       assertEqual "State should be 0, as nothing should have happened" 0 v
@@ -647,17 +606,9 @@ main = hspec $ do
     it "should be able to deal with lots of large jobs" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "big-1" (BigState mvar))
-      wthread1 <- forkIO (worker hworker)
-      wthread2 <- forkIO (worker hworker)
-      wthread3 <- forkIO (worker hworker)
-      wthread4 <- forkIO (worker hworker)
       let content = T.intercalate "\n" (take 1000 (repeat "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
       replicateM_ 5000 (queue hworker (BigJob content))
-      threadDelay 10000000
-      killThread wthread1
-      killThread wthread2
-      killThread wthread3
-      killThread wthread4
+      mapConcurrently_ runJobs [hworker, hworker, hworker, hworker]
       destroy hworker
       v <- takeMVar mvar
       assertEqual "Should have processed 5000" 5000 v
@@ -831,3 +782,15 @@ expectBatchSummary hw batch =
     \case
       Just summary -> return summary
       Nothing      -> fail "Failed to getch batch summary"
+
+
+runJobs :: Job s t => Hworker s t -> IO Int
+runJobs hw =
+  let
+    loop n =
+      execWorker hw >>=
+        \case
+          NoJobs -> return n
+          _      -> loop (n + 1)
+  in
+  loop 0

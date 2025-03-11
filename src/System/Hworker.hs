@@ -65,8 +65,13 @@ module System.Hworker
   , createWith
   , destroy
   , worker
+  , WorkerResult(..)
+  , execWorker
   , scheduler
+  , execScheduler
   , monitor
+  , JobProgress(..)
+  , execMonitor
     -- * Queuing Jobs
   , queue
   , queuePriority
@@ -798,13 +803,31 @@ stopBatchQueueing hw batch =
 
 worker :: Job s t => Hworker s t -> IO ()
 worker hw =
+  forever $
+    execWorker hw >>=
+      \case
+        NoJobs         -> threadDelay 10000
+        DequeueError _ -> return ()
+        BrokenJob _    -> return ()
+        JobDone _ _    -> return ()
+
+
+-- | The result of a single worker operation.
+
+data WorkerResult t
+  = NoJobs
+  | DequeueError Text
+  | BrokenJob ByteString
+  | JobDone t Result
+
+
+-- | Removes one job from the queue, if there are any, and executes it.
+-- This can be useful for testing, as you don't have to fork an entire worker
+-- thread.
+
+execWorker :: Job s t => Hworker s t -> IO (WorkerResult t)
+execWorker hw =
   let
-    delayAndRun =
-      threadDelay 10000 >> worker hw
-
-    justRun =
-      worker hw
-
     runJob action = do
       eitherResult <-
         catchJust
@@ -851,10 +874,11 @@ worker hw =
 
   case eitherReply of
     Left err -> do
-      hwlog hw err >> delayAndRun
+      hwlog hw err
+      return $ DequeueError $ T.pack $ show err
 
     Right Nothing ->
-      delayAndRun
+      return NoJobs
 
     Right (Just t) -> do
       when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING" :: Text, t)
@@ -874,7 +898,7 @@ worker hw =
               [progressQueue hw, brokenQueue hw]
               [t, LB.toStrict $ A.encode now']
 
-          delayAndRun
+          return $ BrokenJob t
 
         Just (JobRef _ maybeBatch maybeCron, j) ->
           let
@@ -893,14 +917,15 @@ worker hw =
                       runRedis (hworkerConnection hw)
                         $ R.hdel (progressQueue hw) [t]
                     nextCron
-                    case deletionResult of
-                      Left err -> hwlog hw err >> delayAndRun
-                      Right 1  -> justRun
-                      Right n  -> do
-                        hwlog hw ("Job done: did not delete 1, deleted " <> show n)
-                        delayAndRun
 
-                  Just batch ->
+                    case deletionResult of
+                      Left err -> hwlog hw err >> return ()
+                      Right 1  -> return ()
+                      Right n  -> hwlog hw ("Job done: did not delete 1, deleted " <> show n)
+
+                    return $ JobDone j Success
+
+                  Just batch -> do
                     runWithMaybe hw
                       ( R.eval
                           "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
@@ -924,13 +949,13 @@ worker hw =
                           case decodeBatchSummary batch hm of
                             Nothing -> do
                               hwlog hw ("Job done: did not delete 1" :: Text)
-                              delayAndRun
 
                             Just summary -> do
                               when (batchSummaryStatus summary == BatchFinished)
                                 $ hworkerBatchCompleted hw summary
-                              justRun
                       )
+
+                    return $ JobDone j Success
 
               Retry msg -> do
                 hwlog hw ("RETRY: " <> msg)
@@ -959,7 +984,7 @@ worker hw =
                         [progressQueue hw, jobQueue hw, batchCounter hw batch]
                         [t]
 
-                delayAndRun
+                return $ JobDone j $ Retry msg
 
               Failure msg -> do
                 hwlog hw ("Failure: " <> msg)
@@ -1004,39 +1029,52 @@ worker hw =
                       )
 
                 nextCron
-                delayAndRun
+                return $ JobDone j $ Failure msg
 
 
 -- | Start a scheduler. Like 'worker', this is blocking, so should be
 -- started in a thread. This is responsible for pushing scheduled jobs
 -- to the queue at the expected time.
 
-scheduler :: forall s t . Job s t => Hworker s t -> IO ()
+scheduler :: Job s t => Hworker s t -> IO ()
 scheduler hw =
   forever $ do
     now <- getCurrentTime
+    execScheduler hw now
+    threadDelay 500000
 
-    runRedis (hworkerConnection hw) $
-      withNil hw $
-        R.eval
-          "local job = redis.call('zrangebyscore', KEYS[1], 0, ARGV[1], 'limit', 0, 1)[1]\n\
-          \if job ~= nil then\n\
-          \  redis.call('lpush', KEYS[2], tostring(job))\n\
-          \  redis.call('zrem', KEYS[1], tostring(job))\n\
-          \  local cron = cjson.decode(job)[1]['s']\n\
-          \  if cron ~= cjson.null then\n\
-          \    redis.call('hset', KEYS[3], tostring(cron), ARGV[1])\n\
-          \    return tostring(cron) \n\
-          \  end\n\
-          \end\n\
-          \return nil"
-          [ scheduleQueue hw
-          , priorityQueue hw
-          , cronProcessing hw
-          ]
-          [ B8.pack $ show (utcToDouble now) ]
 
-    threadDelay 500000 >> scheduler hw
+-- | Execute a single check of the scheduler queue. The next job available at
+-- the given time is pushed to the job queue and returned by this function.
+-- Like `execWorker` this can also be useful for testing.
+
+execScheduler ::
+  Job s t => Hworker s t -> UTCTime -> IO (Maybe (ByteString, UTCTime))
+execScheduler hw now =
+  runRedis (hworkerConnection hw) $
+    R.eval
+      "local job = redis.call('zrangebyscore', KEYS[1], 0, ARGV[1], 'limit', 0, 1)[1]\n\
+      \if job ~= nil then\n\
+      \  redis.call('lpush', KEYS[2], tostring(job))\n\
+      \  redis.call('zrem', KEYS[1], tostring(job))\n\
+      \  local cron = cjson.decode(job)[1]['s']\n\
+      \  if cron ~= cjson.null then\n\
+      \    redis.call('hset', KEYS[3], tostring(cron), ARGV[1])\n\
+      \    return tostring(cron)\n\
+      \  end\n\
+      \  return job\n\
+      \end\n\
+      \return nil"
+      [ scheduleQueue hw
+      , priorityQueue hw
+      , cronProcessing hw
+      ]
+      [ B8.pack $ show (utcToDouble now) ]
+    >>=
+      \case
+        Left err       -> liftIO (hwlog hw err) >> return Nothing
+        Right Nothing  -> return Nothing
+        Right (Just j) -> return $ Just (j, now)
 
 
 -- | Start a monitor. Like 'worker', this is blocking, so should be
@@ -1048,35 +1086,68 @@ scheduler hw =
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $ do
-    now <- getCurrentTime
-
-    runWithList hw (R.hkeys (progressQueue hw)) $ \js ->
-      forM_ js $ \j ->
-        runWithMaybe hw (R.hget (progressQueue hw) j) $
-          \start ->
-            let
-              duration =
-                diffUTCTime now (parseTime start)
-
-            in
-            when (duration > hworkerJobTimeout hw) $ do
-              n <-
-                runWithInt hw $
-                  R.eval
-                    "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
-                    \if del == 1 then\
-                    \  redis.call('rpush', KEYS[1], ARGV[1])\n\
-                    \end\n\
-                    \return del"
-                    [jobQueue hw, progressQueue hw]
-                    [j]
-              when (hworkerDebug hw)
-                $ hwlog hw ("MONITOR RV" :: Text, n)
-              when (hworkerDebug hw && n == 1)
-                $ hwlog hw ("MONITOR REQUEUED" :: Text, j)
-
+    execMonitor hw
     -- NOTE(dbp 2015-07-25): We check every 1/10th of timeout.
     threadDelay (floor $ 100000 * hworkerJobTimeout hw)
+
+
+data JobProgress
+  = Running NominalDiffTime
+  | Requeued
+  deriving (Eq, Show)
+
+
+execMonitor :: Job s t => Hworker s t -> IO [(ByteString, JobProgress)]
+execMonitor hw = do
+  now <- getCurrentTime
+
+  runRedis (hworkerConnection hw) (R.hkeys (progressQueue hw)) >>=
+    \case
+      Left err ->
+        hwlog hw err >> return []
+
+      Right [] ->
+        return []
+
+      Right js -> do
+        progress <-
+          traverse
+            ( \j ->
+                runRedis (hworkerConnection hw) (R.hget (progressQueue hw) j) >>=
+                  \case
+                    Left err ->
+                      hwlog hw err >> return []
+
+                    Right Nothing ->
+                      return []
+
+                    Right (Just start) ->
+                      let
+                        duration =
+                          diffUTCTime now (parseTime start)
+
+                      in
+                      if (duration > hworkerJobTimeout hw) then do
+                        n <-
+                          runWithInt hw $
+                            R.eval
+                              "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
+                              \if del == 1 then\
+                              \  redis.call('rpush', KEYS[1], ARGV[1])\n\
+                              \end\n\
+                              \return del"
+                              [jobQueue hw, progressQueue hw]
+                              [j]
+                        when (hworkerDebug hw)
+                          $ hwlog hw ("MONITOR RV" :: Text, n)
+                        when (hworkerDebug hw && n == 1)
+                          $ hwlog hw ("MONITOR REQUEUED" :: Text, j)
+                        return [(j, Requeued)]
+                      else
+                        return [(j, Running duration)]
+            ) js
+
+        return $ mconcat progress
 
 
 -- | Returns the jobs that could not be deserialized, most likely
