@@ -80,6 +80,7 @@ module System.Hworker
   , streamBatch
   , streamBatchTx
   , initBatch
+  , cancelBatch
   , stopBatchQueueing
     -- * Cron Jobs
   , initCron
@@ -119,7 +120,7 @@ import qualified Data.ByteString.Lazy   as LB
 import           Data.Conduit            ( ConduitT )
 import qualified Data.Conduit           as Conduit
 import           Data.Either             ( isRight )
-import           Data.Maybe              ( isJust, mapMaybe, listToMaybe )
+import           Data.Maybe              ( fromMaybe, isJust, mapMaybe, listToMaybe )
 import           Data.Text               ( Text )
 import qualified Data.Text              as T
 import qualified Data.Text.Encoding     as T
@@ -155,7 +156,7 @@ data Result
   = Success
   | Retry Text
   | Failure Text
-  deriving (Generic, Show)
+  deriving (Generic, Eq, Show)
 
 
 instance ToJSON Result
@@ -245,6 +246,7 @@ data BatchStatus
   | BatchFailed
   | BatchProcessing
   | BatchFinished
+  | BatchCanceled
   deriving (Eq, Show)
 
 
@@ -262,6 +264,7 @@ data BatchSummary =
     , batchSummarySuccesses :: Int
     , batchSummaryFailures  :: Int
     , batchSummaryRetries   :: Int
+    , batchSummaryCanceled  :: Int
     , batchSummaryStatus    :: BatchStatus
     } deriving (Eq, Show)
 
@@ -806,10 +809,11 @@ worker hw =
   forever $
     execWorker hw >>=
       \case
-        NoJobs         -> threadDelay 10000
-        DequeueError _ -> threadDelay 10000
-        BrokenJob _    -> threadDelay 10000
-        JobDone _ _    -> return ()
+        NoJobs           -> threadDelay 10000
+        DequeueError _   -> threadDelay 10000
+        BrokenJob _      -> threadDelay 10000
+        CanceledJob _    -> return ()
+        CompletedJob _ _ -> return ()
 
 
 -- | The result of a single worker operation.
@@ -818,7 +822,9 @@ data WorkerResult t
   = NoJobs
   | DequeueError Text
   | BrokenJob ByteString
-  | JobDone t Result
+  | CanceledJob Bool
+  | CompletedJob t Result
+  deriving (Eq, Show)
 
 
 -- | Removes one job from the queue, if there are any, and executes it.
@@ -864,13 +870,35 @@ execWorker hw =
       R.eval
         "local job = redis.call('brpop', KEYS[1], KEYS[2], '0.0001')\n\
         \if job then\n\
-        \  redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
-        \  return job[2]\n\
+        \  local status = nil\n\
+        \  local batch = cjson.decode(job[2])[1]['b']\n\
+        \  local summary = ''\n\
+        \  if batch ~= nil then \n\
+        \    summary = KEYS[4] .. tostring(batch)\n\
+        \    status = redis.call('hget', summary, 'status')\n\
+        \  end \n\
+        \  if tostring(status) == 'canceled' then\n\
+        \    redis.call('hincrby', summary, 'canceled', '1')\n\
+        \    local completed = redis.call('hincrby', summary, 'completed', '1')\n\
+        \    local queued = redis.call('hincrby', summary, 'queued', '0')\n\
+        \    if tonumber(completed) >= tonumber(queued) then \n\
+        \      status = 'canceled' \n\
+        \    else\n\
+        \      status = 'canceling' \n\
+        \    end \n\
+        \  else\n\
+        \    redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
+        \  end\n\
+        \  return { job[2], tostring(status), summary }\n\
         \else\n\
         \  return nil\n\
         \end"
-        [priorityQueue hw, jobQueue hw, progressQueue hw]
-        [LB.toStrict $ A.encode now]
+        [ priorityQueue hw
+        , jobQueue hw
+        , progressQueue hw
+        , "hworker-batch-" <> hworkerName hw <> ":"
+        ]
+        [ LB.toStrict $ A.encode now ]
 
   case eitherReply of
     Left err -> do
@@ -880,7 +908,26 @@ execWorker hw =
     Right Nothing ->
       return NoJobs
 
-    Right (Just t) -> do
+    Right (Just [t, b, _]) | b == "canceling" -> do
+      when (hworkerDebug hw) $ hwlog hw ("CANCELED JOB" :: Text, t)
+      return $ CanceledJob False
+
+    Right (Just [t, b, k]) | b == "canceled" -> do
+      when (hworkerDebug hw) $ hwlog hw ("CANCELED JOB" :: Text, t)
+
+      case UUID.fromASCIIBytes k of
+        Nothing ->
+          return ()
+
+        Just uuid ->
+          batchSummary hw (BatchId uuid) >>=
+            \case
+              Nothing      -> return ()
+              Just summary -> hworkerBatchCompleted hw summary
+
+      return $ CanceledJob True
+
+    Right (Just [t, _, _]) -> do
       when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING" :: Text, t)
 
       case A.decodeStrict t of
@@ -923,7 +970,7 @@ execWorker hw =
                       Right 1  -> return ()
                       Right n  -> hwlog hw ("Job done: did not delete 1, deleted " <> show n)
 
-                    return $ JobDone j Success
+                    return $ CompletedJob j Success
 
                   Just batch -> do
                     runWithMaybe hw
@@ -955,7 +1002,7 @@ execWorker hw =
                                 $ hworkerBatchCompleted hw summary
                       )
 
-                    return $ JobDone j Success
+                    return $ CompletedJob j Success
 
               Retry msg -> do
                 hwlog hw ("RETRY: " <> msg)
@@ -984,7 +1031,7 @@ execWorker hw =
                         [progressQueue hw, jobQueue hw, batchCounter hw batch]
                         [t]
 
-                return $ JobDone j $ Retry msg
+                return $ CompletedJob j $ Retry msg
 
               Failure msg -> do
                 hwlog hw ("Failure: " <> msg)
@@ -1029,7 +1076,12 @@ execWorker hw =
                       )
 
                 nextCron
-                return $ JobDone j $ Failure msg
+                return $ CompletedJob j $ Failure msg
+
+    Right (Just ls) ->
+      return
+        $ DequeueError
+        $ "Unexpected script result: " <> T.pack (show ls)
 
 
 -- | Start a scheduler. Like 'worker', this is blocking, so should be
@@ -1281,6 +1333,7 @@ initBatch hw mseconds = do
         , ("successes", "0")
         , ("failures", "0")
         , ("retries", "0")
+        , ("canceled", "0")
         , ("status", "queueing")
         ]
     case r of
@@ -1293,6 +1346,16 @@ initBatch hw mseconds = do
           Just s  -> void $ R.expire (batchCounter hw batch) s
 
         return (Just batch)
+
+
+-- | Cancels a batch of jobs. All jobs for this batch that are still in the
+-- worker queue are not run once they're taken off of the queue.
+
+cancelBatch :: Hworker s t -> BatchId -> IO ()
+cancelBatch hw batch =
+  runRedis (hworkerConnection hw)
+    $ void
+    $ R.hset (batchCounter hw batch) "status" "canceled"
 
 
 -- | Return a summary of the batch.
@@ -1362,18 +1425,24 @@ withInt hw a =
 -- Parsing Helpers
 
 encodeBatchStatus :: BatchStatus -> ByteString
-encodeBatchStatus BatchQueueing   = "queueing"
-encodeBatchStatus BatchFailed     = "failed"
-encodeBatchStatus BatchProcessing = "processing"
-encodeBatchStatus BatchFinished   = "finished"
+encodeBatchStatus =
+  \case
+    BatchQueueing   -> "queueing"
+    BatchFailed     -> "failed"
+    BatchProcessing -> "processing"
+    BatchFinished   -> "finished"
+    BatchCanceled   -> "canceled"
 
 
 decodeBatchStatus :: ByteString -> Maybe BatchStatus
-decodeBatchStatus "queueing"   = Just BatchQueueing
-decodeBatchStatus "failed"     = Just BatchFailed
-decodeBatchStatus "processing" = Just BatchProcessing
-decodeBatchStatus "finished"   = Just BatchFinished
-decodeBatchStatus _            = Nothing
+decodeBatchStatus =
+  \case
+    "queueing"   -> Just BatchQueueing
+    "failed"     -> Just BatchFailed
+    "processing" -> Just BatchProcessing
+    "finished"   -> Just BatchFinished
+    "canceled"   -> Just BatchCanceled
+    _            -> Nothing
 
 
 decodeBatchSummary :: BatchId -> [(ByteString, ByteString)] -> Maybe BatchSummary
@@ -1384,6 +1453,7 @@ decodeBatchSummary batch hm =
     <*> (lookup "successes" hm >>= readMaybe)
     <*> (lookup "failures" hm >>= readMaybe)
     <*> (lookup "retries" hm >>= readMaybe)
+    <*> (pure $ fromMaybe 0 $ lookup "canceled" hm >>= readMaybe)
     <*> (lookup "status" hm >>= decodeBatchStatus)
 
 
