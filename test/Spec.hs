@@ -278,6 +278,47 @@ main = hspec $ do
       batchSummaryStatus summary `shouldBe` BatchFinished
       destroy hworker
 
+    it "should cancel batch job" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      batch <- startBatch hworker Nothing
+      queueBatch hworker batch False [SimpleJob, SimpleJob, SimpleJob]
+
+      job1 <- execWorker hworker
+      job1 `shouldBe` CompletedJob SimpleJob Success
+      cancelBatch hworker batch
+      summary1 <- expectBatchSummary hworker batch
+      batchSummaryStatus summary1 `shouldBe` BatchCanceled
+      batchSummaryQueued summary1 `shouldBe` 3
+      batchSummaryFailures summary1 `shouldBe` 0
+      batchSummarySuccesses summary1 `shouldBe` 1
+      batchSummaryCanceled summary1 `shouldBe` 0
+      batchSummaryCompleted summary1 `shouldBe` 1
+
+      job2 <- execWorker hworker
+      job2 `shouldBe` CanceledJob False
+      summary2 <- expectBatchSummary hworker batch
+      batchSummaryStatus summary2 `shouldBe` BatchCanceled
+      batchSummaryQueued summary2 `shouldBe` 3
+      batchSummaryFailures summary2 `shouldBe` 0
+      batchSummarySuccesses summary2 `shouldBe` 1
+      batchSummaryCanceled summary2 `shouldBe` 1
+      batchSummaryCompleted summary2 `shouldBe` 2
+
+      job3 <- execWorker hworker
+      job3 `shouldBe` CanceledJob True
+      summary3 <- expectBatchSummary hworker batch
+      batchSummaryStatus summary3 `shouldBe` BatchCanceled
+      batchSummaryQueued summary3 `shouldBe` 3
+      batchSummaryFailures summary3 `shouldBe` 0
+      batchSummarySuccesses summary3 `shouldBe` 1
+      batchSummaryCanceled summary3 `shouldBe` 2
+      batchSummaryCompleted summary3 `shouldBe` 3
+
+      destroy hworker
+      v <- takeMVar mvar
+      v `shouldBe` 1
+
     describe "Atomicity Tests" $ do
       it "should queue all jobs" $ do
         mvar <- newMVar 0
