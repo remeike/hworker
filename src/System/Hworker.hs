@@ -81,6 +81,8 @@ module System.Hworker
   , streamBatchTx
   , initBatch
   , cancelBatch
+  , pauseBatch
+  , resumeBatch
   , stopBatchQueueing
     -- * Cron Jobs
   , initCron
@@ -91,6 +93,7 @@ module System.Hworker
   , listJobs
   , listFailed
   , listScheduled
+  , countPaused
   , getCronProcessing
   , broken
   , batchSummary
@@ -120,7 +123,11 @@ import qualified Data.ByteString.Lazy   as LB
 import           Data.Conduit            ( ConduitT )
 import qualified Data.Conduit           as Conduit
 import           Data.Either             ( isRight )
-import           Data.Maybe              ( fromMaybe, isJust, mapMaybe, listToMaybe )
+import           Data.Maybe              ( fromMaybe
+                                         , isJust
+                                         , listToMaybe
+                                         , mapMaybe
+                                         )
 import           Data.Text               ( Text )
 import qualified Data.Text              as T
 import qualified Data.Text.Encoding     as T
@@ -247,6 +254,7 @@ data BatchStatus
   | BatchProcessing
   | BatchFinished
   | BatchCanceled
+  | BatchPaused
   deriving (Eq, Show)
 
 
@@ -430,12 +438,13 @@ createWith HworkerConfig{..} = do
 
 destroy :: Job s t => Hworker s t -> IO ()
 destroy hw =
-  let
-    batchKeys =
-      "hworker-batch-" <> hworkerName hw <> "*"
-  in
   void $ runRedis (hworkerConnection hw) $ do
-    R.keys batchKeys >>=
+    R.keys (batchCounterPrefix hw <> "*") >>=
+      \case
+        Left  err  -> liftIO $ hwlog hw err
+        Right keys -> void $ R.del keys
+
+    R.keys (batchPausedPrefix hw <> "*") >>=
       \case
         Left  err  -> liftIO $ hwlog hw err
         Right keys -> void $ R.del keys
@@ -484,7 +493,22 @@ scheduleQueue hw =
 
 batchCounter :: Hworker s t -> BatchId -> ByteString
 batchCounter hw (BatchId batch) =
-  "hworker-batch-" <> hworkerName hw <> ":" <> UUID.toASCIIBytes batch
+  batchCounterPrefix hw <> UUID.toASCIIBytes batch
+
+
+batchCounterPrefix :: Hworker s t -> ByteString
+batchCounterPrefix hw =
+  "hworker-batch-" <> hworkerName hw <> ":"
+
+
+batchPaused :: Hworker s t -> BatchId -> ByteString
+batchPaused hw (BatchId batch) =
+  batchPausedPrefix hw <> UUID.toASCIIBytes batch
+
+
+batchPausedPrefix :: Hworker s t -> ByteString
+batchPausedPrefix hw =
+  "hworker-batch-paused-jobs-" <> hworkerName hw <> ":"
 
 
 cronSchedule :: Hworker s t -> ByteString
@@ -813,6 +837,7 @@ worker hw =
         DequeueError _   -> threadDelay 10000
         BrokenJob _      -> threadDelay 10000
         CanceledJob _    -> return ()
+        PausedJob        -> return ()
         CompletedJob _ _ -> return ()
 
 
@@ -823,6 +848,7 @@ data WorkerResult t
   | DequeueError Text
   | BrokenJob ByteString
   | CanceledJob Bool
+  | PausedJob
   | CompletedJob t Result
   deriving (Eq, Show)
 
@@ -876,16 +902,18 @@ execWorker hw =
         \  if batch ~= nil then \n\
         \    summary = KEYS[4] .. tostring(batch)\n\
         \    status = redis.call('hget', summary, 'status')\n\
-        \  end \n\
+        \  end\n\
         \  if tostring(status) == 'canceled' then\n\
         \    redis.call('hincrby', summary, 'canceled', '1')\n\
         \    local completed = redis.call('hincrby', summary, 'completed', '1')\n\
         \    local queued = redis.call('hincrby', summary, 'queued', '0')\n\
-        \    if tonumber(completed) >= tonumber(queued) then \n\
-        \      status = 'canceled' \n\
+        \    if tonumber(completed) >= tonumber(queued) then\n\
+        \      status = 'canceled'\n\
         \    else\n\
-        \      status = 'canceling' \n\
+        \      status = 'canceling'\n\
         \    end \n\
+        \  elseif tostring(status) == 'paused' then\n\
+        \    redis.call('lpush', KEYS[5] .. tostring(batch), tostring(job[2]))\n\
         \  else\n\
         \    redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
         \  end\n\
@@ -896,7 +924,8 @@ execWorker hw =
         [ priorityQueue hw
         , jobQueue hw
         , progressQueue hw
-        , "hworker-batch-" <> hworkerName hw <> ":"
+        , batchCounterPrefix hw
+        , batchPausedPrefix hw
         ]
         [ LB.toStrict $ A.encode now ]
 
@@ -907,6 +936,10 @@ execWorker hw =
 
     Right Nothing ->
       return NoJobs
+
+    Right (Just [t, b, _]) | b == "paused" -> do
+      when (hworkerDebug hw) $ hwlog hw ("PAUSED JOB" :: Text, t)
+      return PausedJob
 
     Right (Just [t, b, _]) | b == "canceling" -> do
       when (hworkerDebug hw) $ hwlog hw ("CANCELED JOB" :: Text, t)
@@ -1282,6 +1315,14 @@ listScheduled hw offset limit =
             xs
 
 
+countPaused :: Hworker s t -> BatchId -> IO Integer
+countPaused hw batch =
+  runRedis (hworkerConnection hw) (R.llen (batchPaused hw batch)) >>=
+    \case
+      Left  _ -> return 0
+      Right n -> return n
+
+
 -- | Returns timestamp of active cron job.
 
 getCronProcessing :: Job s t => Hworker s t -> Text -> IO (Maybe Double)
@@ -1348,14 +1389,89 @@ initBatch hw mseconds = do
         return (Just batch)
 
 
--- | Cancels a batch of jobs. All jobs for this batch that are still in the
+-- | Cancels a batch of jobs. All jobs for the batch that are still in the
 -- worker queue are not run once they're taken off of the queue.
 
-cancelBatch :: Hworker s t -> BatchId -> IO ()
+cancelBatch :: Hworker s t -> BatchId -> IO Bool
 cancelBatch hw batch =
-  runRedis (hworkerConnection hw)
-    $ void
-    $ R.hset (batchCounter hw batch) "status" "canceled"
+  runRedis (hworkerConnection hw) $
+    R.hget (batchCounter hw batch) "status" >>=
+      \case
+        Left err -> do
+          when (hworkerDebug hw) $ liftIO $ hwlog hw err
+          return False
+
+        Right Nothing ->
+          return False
+
+        Right (Just status) ->
+          if status == "processing" || status == "queueing" || status == "paused"
+            then do
+              void $ R.hset (batchCounter hw batch) "status" "canceled"
+              when (status == "paused") $ void $ R.del [batchPaused hw batch]
+              return True
+            else
+              return False
+
+-- | Pauses a batch of jobs. All jobs for the batch that are still in the
+-- worker queue are moved to a separate list once they're take of the the queue
+-- and are place back into the job queue once the batch is resumed.
+
+pauseBatch :: Hworker s t -> BatchId -> IO Bool
+pauseBatch hw batch =
+  runRedis (hworkerConnection hw) $
+    R.hget (batchCounter hw batch) "status" >>=
+      \case
+        Left err -> do
+          when (hworkerDebug hw) $ liftIO $ hwlog hw err
+          return False
+
+        Right Nothing ->
+          return False
+
+        Right (Just status) ->
+          if status == "processing" || status == "queueing" then do
+            void $ R.persist (batchCounter hw batch)
+            void $ R.hset (batchCounter hw batch) "status" "paused"
+            return True
+          else
+            return False
+
+
+-- | Resumes a batch of jobs.
+
+resumeBatch :: Hworker s t -> BatchId -> IO Bool
+resumeBatch hw batch =
+  runRedis (hworkerConnection hw) $
+    batchSummary' hw batch >>=
+      \case
+        Nothing ->
+          return False
+
+        Just summary | batchSummaryStatus summary == BatchPaused -> do
+          withNil hw $
+            R.eval
+              "redis.call('hset', KEYS[1], 'status', 'processing')\n\
+              \local s = KEYS[2]\n\
+              \local d = KEYS[3]\n\
+              \local l = redis.call('llen', s)\n\
+              \local i = tonumber(l)\n\
+              \\n\
+              \while i > 0 do\n\
+              \  local v = redis.call('rpoplpush', s, d)\n\
+              \  i = i - 1\n\
+              \end\n\
+              \return nil"
+              [ batchCounter hw batch
+              , batchPaused hw batch
+              , jobQueue hw
+              ]
+              []
+
+          return True
+
+        Just _ ->
+          return False
 
 
 -- | Return a summary of the batch.
@@ -1432,6 +1548,7 @@ encodeBatchStatus =
     BatchProcessing -> "processing"
     BatchFinished   -> "finished"
     BatchCanceled   -> "canceled"
+    BatchPaused     -> "paused"
 
 
 decodeBatchStatus :: ByteString -> Maybe BatchStatus
@@ -1442,6 +1559,7 @@ decodeBatchStatus =
     "processing" -> Just BatchProcessing
     "finished"   -> Just BatchFinished
     "canceled"   -> Just BatchCanceled
+    "paused"     -> Just BatchPaused
     _            -> Nothing
 
 

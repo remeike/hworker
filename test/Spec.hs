@@ -8,7 +8,7 @@
 import           Control.Concurrent       ( forkIO, killThread, threadDelay )
 import           Control.Concurrent.Async ( mapConcurrently_ )
 import           Control.Concurrent.MVar  ( MVar, modifyMVarMasked_, newMVar
-                                          , readMVar, takeMVar
+                                          , readMVar
                                           )
 import           Control.Monad            ( replicateM_, void )
 import           Control.Monad.Trans      ( lift, liftIO )
@@ -37,7 +37,7 @@ main = hspec $ do
       queue hworker SimpleJob
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 1 after job runs" 1 v
 
     it "queueing 2 jobs should increment twice" $ do
@@ -47,7 +47,7 @@ main = hspec $ do
       queue hworker SimpleJob
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 2 after 2 jobs run" 2 v
 
     it "queueing 1000 jobs should increment 1000" $ do
@@ -56,7 +56,7 @@ main = hspec $ do
       replicateM_ 1000 (queue hworker SimpleJob)
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 1000 after 1000 job runs" 1000 v
 
     it "should work with multiple workers" $ do
@@ -67,7 +67,7 @@ main = hspec $ do
       replicateM_ 1000 (queue hworker SimpleJob)
       mapConcurrently_ runJobs [hworker, hworker, hworker, hworker]
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 1000 after 1000 job runs" 1000 v
 
   describe "Priority Jobs" $ do
@@ -79,7 +79,7 @@ main = hspec $ do
       queuePriority hworker $ PriorityJob "a"
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be [c,b,a] after job runs" ["c","b","a"] v
 
   describe "Exceptions" $ do
@@ -93,7 +93,7 @@ main = hspec $ do
       queue hworker ExJob
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       listJobs hworker 0 10
       assertEqual "State should be 2, since the first run failed" 2 v
 
@@ -103,7 +103,7 @@ main = hspec $ do
       queue hworker ExJob
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 1, since failing run wasn't retried" 1 v
 
   describe "Retry" $ do
@@ -113,7 +113,7 @@ main = hspec $ do
       queue hworker RetryJob
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 2, since it got retried" 2 v
 
   describe "Fail" $ do
@@ -123,7 +123,7 @@ main = hspec $ do
       queue hworker FailJob
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 1, since failing run wasn't retried" 1 v
 
     it "should put a failed job into the failed queue" $ do
@@ -148,7 +148,7 @@ main = hspec $ do
       runJobs hworker
       failedJobs <- listFailed hworker 0 100
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 4, since all jobs were run" 4 v
       assertEqual "Should only have stored 2" [AlwaysFailJob,AlwaysFailJob] failedJobs
 
@@ -268,7 +268,7 @@ main = hspec $ do
       queueBatch hworker batch False (replicate 1000 SimpleJob)
       stopBatchQueueing hworker batch
       runJobs hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       v `shouldBe` 1000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1000
@@ -278,46 +278,172 @@ main = hspec $ do
       batchSummaryStatus summary `shouldBe` BatchFinished
       destroy hworker
 
-    it "should cancel batch job" $ do
-      mvar <- newMVar 0
-      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      batch <- startBatch hworker Nothing
-      queueBatch hworker batch False [SimpleJob, SimpleJob, SimpleJob]
+    describe "Canceled and Paused Batched Jobs" $ do
+      it "should cancel batch" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        queueBatch hworker batch False [SimpleJob, SimpleJob, SimpleJob]
 
-      job1 <- execWorker hworker
-      job1 `shouldBe` CompletedJob SimpleJob Success
-      cancelBatch hworker batch
-      summary1 <- expectBatchSummary hworker batch
-      batchSummaryStatus summary1 `shouldBe` BatchCanceled
-      batchSummaryQueued summary1 `shouldBe` 3
-      batchSummaryFailures summary1 `shouldBe` 0
-      batchSummarySuccesses summary1 `shouldBe` 1
-      batchSummaryCanceled summary1 `shouldBe` 0
-      batchSummaryCompleted summary1 `shouldBe` 1
+        execWorker hworker >>= shouldBe (CompletedJob SimpleJob Success)
+        cancelBatch hworker batch >>= shouldBe True
+        summary1 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary1 `shouldBe` BatchCanceled
+        batchSummaryQueued summary1 `shouldBe` 3
+        batchSummaryFailures summary1 `shouldBe` 0
+        batchSummarySuccesses summary1 `shouldBe` 1
+        batchSummaryCanceled summary1 `shouldBe` 0
+        batchSummaryCompleted summary1 `shouldBe` 1
 
-      job2 <- execWorker hworker
-      job2 `shouldBe` CanceledJob False
-      summary2 <- expectBatchSummary hworker batch
-      batchSummaryStatus summary2 `shouldBe` BatchCanceled
-      batchSummaryQueued summary2 `shouldBe` 3
-      batchSummaryFailures summary2 `shouldBe` 0
-      batchSummarySuccesses summary2 `shouldBe` 1
-      batchSummaryCanceled summary2 `shouldBe` 1
-      batchSummaryCompleted summary2 `shouldBe` 2
+        execWorker hworker >>= shouldBe (CanceledJob False)
+        summary2 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary2 `shouldBe` BatchCanceled
+        batchSummaryQueued summary2 `shouldBe` 3
+        batchSummaryFailures summary2 `shouldBe` 0
+        batchSummarySuccesses summary2 `shouldBe` 1
+        batchSummaryCanceled summary2 `shouldBe` 1
+        batchSummaryCompleted summary2 `shouldBe` 2
 
-      job3 <- execWorker hworker
-      job3 `shouldBe` CanceledJob True
-      summary3 <- expectBatchSummary hworker batch
-      batchSummaryStatus summary3 `shouldBe` BatchCanceled
-      batchSummaryQueued summary3 `shouldBe` 3
-      batchSummaryFailures summary3 `shouldBe` 0
-      batchSummarySuccesses summary3 `shouldBe` 1
-      batchSummaryCanceled summary3 `shouldBe` 2
-      batchSummaryCompleted summary3 `shouldBe` 3
+        execWorker hworker >>= shouldBe (CanceledJob True)
+        summary3 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary3 `shouldBe` BatchCanceled
+        batchSummaryQueued summary3 `shouldBe` 3
+        batchSummaryFailures summary3 `shouldBe` 0
+        batchSummarySuccesses summary3 `shouldBe` 1
+        batchSummaryCanceled summary3 `shouldBe` 2
+        batchSummaryCompleted summary3 `shouldBe` 3
 
-      destroy hworker
-      v <- takeMVar mvar
-      v `shouldBe` 1
+        destroy hworker
+        readMVar mvar >>= shouldBe 1
+
+      it "should not cancel batch that is finished, failed, or already canceled" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        -- Finished
+        batch1 <- startBatch hworker Nothing
+        queueBatch hworker batch1 True [SimpleJob, SimpleJob, SimpleJob]
+        runJobs hworker
+        cancelBatch hworker batch1 >>= shouldBe False
+        -- Failed
+        batch2 <- startBatch hworker Nothing
+        void $ streamBatch hworker batch2 True $ do
+          replicateM_ 5 $ Conduit.yield SimpleJob
+          error "BLOW UP!"
+        cancelBatch hworker batch2 >>= shouldBe False
+        -- Canceled
+        batch3 <- startBatch hworker Nothing
+        queueBatch hworker batch3 True [SimpleJob, SimpleJob, SimpleJob]
+        cancelBatch hworker batch3 >>= shouldBe True
+        cancelBatch hworker batch3 >>= shouldBe False
+        destroy hworker
+
+      it "should pause batch job" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        queueBatch hworker batch False [SimpleJob, SimpleJob, SimpleJob]
+
+        execWorker hworker >>= shouldBe (CompletedJob SimpleJob Success)
+        countPaused hworker batch >>= shouldBe 0
+
+        pauseBatch hworker batch
+        execWorker hworker >>= shouldBe PausedJob
+        countPaused hworker batch >>= shouldBe 1
+        summary1 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary1 `shouldBe` BatchPaused
+        batchSummaryQueued summary1 `shouldBe` 3
+        batchSummaryFailures summary1 `shouldBe` 0
+        batchSummarySuccesses summary1 `shouldBe` 1
+        batchSummaryCanceled summary1 `shouldBe` 0
+        batchSummaryCompleted summary1 `shouldBe` 1
+
+        execWorker hworker >>= shouldBe PausedJob
+        countPaused hworker batch >>= shouldBe 2
+        summary2 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary2 `shouldBe` BatchPaused
+        batchSummaryQueued summary2 `shouldBe` 3
+        batchSummaryFailures summary2 `shouldBe` 0
+        batchSummarySuccesses summary2 `shouldBe` 1
+        batchSummaryCanceled summary2 `shouldBe` 0
+        batchSummaryCompleted summary2 `shouldBe` 1
+
+        destroy hworker
+        readMVar mvar >>= shouldBe 1
+
+      it "should resume batch job" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        queueBatch hworker batch False $ replicate 1000 SimpleJob
+
+        execWorker hworker >>= shouldBe (CompletedJob SimpleJob Success)
+
+        pauseBatch hworker batch
+        runJobs hworker
+        countPaused hworker batch >>= shouldBe 999
+        summary1 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary1 `shouldBe` BatchPaused
+        batchSummaryQueued summary1 `shouldBe` 1000
+        batchSummaryFailures summary1 `shouldBe` 0
+        batchSummarySuccesses summary1 `shouldBe` 1
+        batchSummaryCanceled summary1 `shouldBe` 0
+        batchSummaryCompleted summary1 `shouldBe` 1
+        readMVar mvar >>= shouldBe 1
+
+        resumeBatch hworker batch
+        countPaused hworker batch >>= shouldBe 0
+        ls <- listJobs hworker 0 5000
+        length ls `shouldBe` 999
+        summary2 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary2 `shouldBe` BatchProcessing
+
+        runJobs hworker
+        summary3 <- expectBatchSummary hworker batch
+        batchSummaryStatus summary3 `shouldBe` BatchFinished
+        batchSummaryQueued summary3 `shouldBe` 1000
+        batchSummaryFailures summary3 `shouldBe` 0
+        batchSummarySuccesses summary3 `shouldBe` 1000
+        batchSummaryCanceled summary3 `shouldBe` 0
+        batchSummaryCompleted summary3 `shouldBe` 1000
+
+        destroy hworker
+        readMVar mvar >>= shouldBe 1000
+
+      it "should not pause batch that is finished, failed, canceled, or already paused" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        -- Finished
+        batch1 <- startBatch hworker Nothing
+        queueBatch hworker batch1 True [SimpleJob, SimpleJob, SimpleJob]
+        runJobs hworker
+        pauseBatch hworker batch1 >>= shouldBe False
+        -- Failed
+        batch2 <- startBatch hworker Nothing
+        void $ streamBatch hworker batch2 True $ do
+          replicateM_ 5 $ Conduit.yield SimpleJob
+          error "BLOW UP!"
+        pauseBatch hworker batch2 >>= shouldBe False
+        -- Canceled
+        batch3 <- startBatch hworker Nothing
+        queueBatch hworker batch3 True [SimpleJob, SimpleJob, SimpleJob]
+        cancelBatch hworker batch3 >>= shouldBe True
+        pauseBatch hworker batch3 >>= shouldBe False
+        -- Paused
+        batch4 <- startBatch hworker Nothing
+        queueBatch hworker batch4 True [SimpleJob, SimpleJob, SimpleJob]
+        pauseBatch hworker batch4 >>= shouldBe True
+        pauseBatch hworker batch4 >>= shouldBe False
+        destroy hworker
+
+      it "should only resume batch if it is already paused" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        queueBatch hworker batch True [SimpleJob, SimpleJob, SimpleJob]
+        pauseBatch hworker batch >>= shouldBe True
+        resumeBatch hworker batch >>= shouldBe True
+        resumeBatch hworker batch >>= shouldBe False
+        destroy hworker
 
     describe "Atomicity Tests" $ do
       it "should queue all jobs" $ do
@@ -424,7 +550,7 @@ main = hspec $ do
       jobs <- execMonitor hworker
       destroy hworker
       assertEqual "Should no longer be job a job in progress queue" [] jobs
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 1, since first failed" 1 v
 
     it "should add back multiple jobs after timeout" $ do
@@ -457,7 +583,7 @@ main = hspec $ do
       jobs <- execMonitor hworker
       destroy hworker
       assertEqual "Should no longer be job a job in progress queue" [] jobs
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 2, since first 2 failed" 2 v
 
     it "should work with multiple monitors" $ do
@@ -475,10 +601,17 @@ main = hspec $ do
       killThread wthread1
       killThread wthread2
       threadDelay 2000000
-      mapConcurrently_ execMonitor [hworker, hworker, hworker, hworker, hworker, hworker]
+      mapConcurrently_ execMonitor
+        [ hworker
+        , hworker
+        , hworker
+        , hworker
+        , hworker
+        , hworker
+        ]
       runJobs hworker
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 2, since first 2 failed" 2 v
       -- NOTE(dbp 2015-07-24): It would be really great to have a
       -- test that went after a race between the retry logic and
@@ -621,7 +754,7 @@ main = hspec $ do
       runJobs hworker1
       brokenJobs <- broken hworker2
       destroy hworker1
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "State should be 0, as nothing should have happened" 0 v
       assertEqual "Should be one broken job, as serialization is wrong" 1 (length brokenJobs)
 
@@ -651,7 +784,7 @@ main = hspec $ do
       replicateM_ 5000 (queue hworker (BigJob content))
       mapConcurrently_ runJobs [hworker, hworker, hworker, hworker]
       destroy hworker
-      v <- takeMVar mvar
+      v <- readMVar mvar
       assertEqual "Should have processed 5000" 5000 v
 
 
