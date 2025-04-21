@@ -917,7 +917,7 @@ execWorker hw =
         \  else\n\
         \    redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
         \  end\n\
-        \  return { job[2], tostring(status), summary }\n\
+        \  return { job[2], tostring(status), tostring(batch) }\n\
         \else\n\
         \  return nil\n\
         \end"
