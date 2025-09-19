@@ -889,15 +889,18 @@ execWorker hw =
   now <- getCurrentTime
 
   eitherReply <-
-    -- NOTE(rjbf 2025-01-23): We're using `brpop` here just to get a job from
-    -- either of the job queues. Blocking commands do not actually block
-    -- inside Redis transactions so the timeout here has no effect.
     runRedis (hworkerConnection hw) $
       R.eval
-        "local job = redis.call('brpop', KEYS[1], KEYS[2], '0.0001')\n\
+        "local priority = redis.call('rpop', KEYS[1])\n\
+        \local job = nil\n\
+        \if priority then\n\
+        \  job = priority\n\
+        \else\n\
+        \  job = redis.call('rpop', KEYS[2])\n\
+        \end\n\
         \if job then\n\
         \  local status = nil\n\
-        \  local batch = cjson.decode(job[2])[1]['b']\n\
+        \  local batch = cjson.decode(job)[1]['b']\n\
         \  local summary = ''\n\
         \  if batch ~= nil then \n\
         \    summary = KEYS[4] .. tostring(batch)\n\
@@ -913,11 +916,11 @@ execWorker hw =
         \      status = 'canceling'\n\
         \    end \n\
         \  elseif tostring(status) == 'paused' then\n\
-        \    redis.call('lpush', KEYS[5] .. tostring(batch), tostring(job[2]))\n\
+        \    redis.call('lpush', KEYS[5] .. tostring(batch), tostring(job))\n\
         \  else\n\
-        \    redis.call('hset', KEYS[3], tostring(job[2]), ARGV[1])\n\
+        \    redis.call('hset', KEYS[3], tostring(job), ARGV[1])\n\
         \  end\n\
-        \  return { job[2], tostring(status), summary }\n\
+        \  return { job, tostring(status), tostring(batch) }\n\
         \else\n\
         \  return nil\n\
         \end"

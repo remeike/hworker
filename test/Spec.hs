@@ -964,7 +964,11 @@ runJobs hw =
     loop n =
       execWorker hw >>=
         \case
-          NoJobs -> return n
-          _      -> loop (n + 1)
+          NoJobs           -> return n
+          DequeueError err -> print err *> return n
+          BrokenJob _      -> return n
+          CanceledJob _    -> loop (n + 1)
+          PausedJob        -> loop (n + 1)
+          CompletedJob _ _ -> loop (n + 1)
   in
   loop 0
