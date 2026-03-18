@@ -84,6 +84,7 @@ module System.Hworker
   , pauseBatch
   , resumeBatch
   , stopBatchQueueing
+  , deleteBatch
     -- * Cron Jobs
   , initCron
   , queueCron
@@ -314,7 +315,7 @@ data Hworker s t =
     , hworkerJobTimeout        :: NominalDiffTime
     , hworkerFailedQueueSize   :: Int
     , hworkerDebug             :: Bool
-    , hworkerBatchCompleted    :: BatchSummary -> IO ()
+    , hworkerBatchCompleted    :: Hworker s t -> BatchSummary -> IO ()
     }
 
 
@@ -364,7 +365,7 @@ data HworkerConfig s t =
     , hwconfigTimeout           :: NominalDiffTime
     , hwconfigFailedQueueSize   :: Int
     , hwconfigDebug             :: Bool
-    , hwconfigBatchCompleted    :: BatchSummary -> IO ()
+    , hwconfigBatchCompleted    :: Hworker s t -> BatchSummary -> IO ()
     , hwconfigCronJobs          :: [CronJob t]
     }
 
@@ -383,7 +384,7 @@ defaultHworkerConfig name state =
     , hwconfigTimeout           = 120
     , hwconfigFailedQueueSize   = 1000
     , hwconfigDebug             = False
-    , hwconfigBatchCompleted    = const (return ())
+    , hwconfigBatchCompleted    = \_ _ -> return ()
     , hwconfigCronJobs          = []
     }
 
@@ -823,6 +824,16 @@ stopBatchQueueing hw batch =
             $ encodeBatchStatus BatchProcessing
 
 
+-- | Deletes batch. Can be used with the `hworkerBatchCompleted` hook.
+
+
+deleteBatch :: Hworker s t -> BatchId -> IO ()
+deleteBatch hw batch =
+  void
+    $ runRedis (hworkerConnection hw)
+    $ R.del [batchCounter hw batch]
+
+
 -- | Creates a new worker thread. This is blocking, so you will want to
 -- 'forkIO' this into a thread. You can have any number of these (and
 -- on any number of servers); the more there are, the faster jobs will
@@ -959,7 +970,7 @@ execWorker hw =
           batchSummary hw (BatchId uuid) >>=
             \case
               Nothing      -> return ()
-              Just summary -> hworkerBatchCompleted hw summary
+              Just summary -> hworkerBatchCompleted hw hw summary
 
       return $ CanceledJob True
 
@@ -1035,7 +1046,7 @@ execWorker hw =
 
                             Just summary -> do
                               when (batchSummaryStatus summary == BatchFinished)
-                                $ hworkerBatchCompleted hw summary
+                                $ hworkerBatchCompleted hw hw summary
                       )
 
                     return $ CompletedJob j Success
@@ -1108,7 +1119,7 @@ execWorker hw =
                       )
                       ( \hm ->
                           forM_ (decodeBatchSummary batch hm)
-                            $ hworkerBatchCompleted hw
+                            $ hworkerBatchCompleted hw hw
                       )
 
                 nextCron
@@ -1128,7 +1139,7 @@ scheduler :: Job s t => Hworker s t -> IO ()
 scheduler hw =
   forever $ do
     now <- getCurrentTime
-    execScheduler hw now
+    void $ execScheduler hw now
     threadDelay 500000
 
 
@@ -1174,7 +1185,7 @@ execScheduler hw now =
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $ do
-    execMonitor hw
+    void $ execMonitor hw
     -- NOTE(dbp 2015-07-25): We check every 1/10th of timeout.
     threadDelay (floor $ 100000 * hworkerJobTimeout hw)
 

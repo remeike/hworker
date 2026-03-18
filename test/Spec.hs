@@ -278,6 +278,24 @@ main = hspec $ do
       batchSummaryStatus summary `shouldBe` BatchFinished
       destroy hworker
 
+    it "should delete batch at end of process" $ do
+      mvar <- newMVar 0
+      hworker <-
+        createWith
+          (conf "simpleworker-1" (SimpleState mvar))
+            { hwconfigBatchCompleted =
+                \hw batch -> deleteBatch hw (batchSummaryID batch)
+            }
+      batch <- startBatch hworker Nothing
+      queueBatch hworker batch False [SimpleJob]
+      stopBatchQueueing hworker batch
+      summary <- expectBatchSummary hworker batch
+      batchSummaryQueued summary `shouldBe` 1
+      runJobs hworker
+      summary' <- batchSummary hworker batch
+      summary' `shouldBe` Nothing
+      destroy hworker
+
     describe "Canceled and Paused Batched Jobs" $ do
       it "should cancel batch" $ do
         mvar <- newMVar 0
